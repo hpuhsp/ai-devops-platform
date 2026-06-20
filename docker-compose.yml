@@ -1,0 +1,118 @@
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_devops
+      POSTGRES_USER: devops
+      POSTGRES_PASSWORD: devops123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devops -d ai_devops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend API ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://devops:devops123@postgres:5432/ai_devops
+      DATABASE_SYNC_URL: postgresql://devops:devops123@postgres:5432/ai_devops
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DEBUG: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - worktree_data:/tmp/ai-devops-worktrees
+      - repo_data:/tmp/ai-devops-repos
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Celery Worker ───────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://devops:devops123@postgres:5432/ai_devops
+      DATABASE_SYNC_URL: postgresql://devops:devops123@postgres:5432/ai_devops
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - api
+    volumes:
+      - ./backend:/app
+      - worktree_data:/tmp/ai-devops-worktrees
+      - repo_data:/tmp/ai-devops-repos
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+
+  # ── Celery Flower (monitoring) ──────────────────────────────────────
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+    depends_on:
+      - worker
+    command: celery -A app.tasks.celery_app flower --port=5555
+
+  # ── Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      - api
+    volumes:
+      - ./frontend/src:/app/src
+
+  # ── Gitea (local Git platform for testing) ──────────────────────────
+  gitea:
+    image: gitea/gitea:1.21-rootless
+    ports:
+      - "3001:3000"
+      - "2222:22"
+    environment:
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__ROOT_URL: http://localhost:3001
+    volumes:
+      - gitea_data:/var/lib/gitea
+    profiles:
+      - testing   # only start with: docker compose --profile testing up
+
+volumes:
+  postgres_data:
+  worktree_data:
+  repo_data:
+  gitea_data:
