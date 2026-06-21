@@ -1,7 +1,7 @@
 import { Layout, Menu, Typography } from 'antd'
 import {
   DashboardOutlined, SettingOutlined, BranchesOutlined,
-  BellOutlined, RobotOutlined, FileTextOutlined,
+  BellOutlined, RobotOutlined, FileTextOutlined, ApartmentOutlined,
 } from '@ant-design/icons'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 
@@ -15,6 +15,7 @@ const menuItems = [
       { key: '/config/models', icon: <RobotOutlined />, label: 'AI 模型' },
       { key: '/config/repositories', icon: <BranchesOutlined />, label: '代码仓库' },
       { key: '/config/notify', icon: <BellOutlined />, label: '通知配置' },
+      { key: '/config/rules', icon: <ApartmentOutlined />, label: '流水线规则' },
     ],
   },
   { key: '/tasks', icon: <FileTextOutlined />, label: '任务日志' },

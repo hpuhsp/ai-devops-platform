@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # Git WorkTree base directory
     WORKTREE_BASE_DIR: str = "/tmp/ai-devops-worktrees"
 
+    @property
+    def DATABASE_PURE_URL(self) -> str:
+        """psycopg2-compatible URL (no dialect prefix)."""
+        return self.DATABASE_SYNC_URL.replace("postgresql+psycopg2://", "postgresql://")
+
     model_config = {"env_file": ".env", "case_sensitive": True}
 
 

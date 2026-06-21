@@ -4,6 +4,7 @@ import DashboardPage from './pages/dashboard/DashboardPage'
 import ModelsPage from './pages/config/ModelsPage'
 import RepositoriesPage from './pages/config/RepositoriesPage'
 import NotifyPage from './pages/config/NotifyPage'
+import RulesPage from './pages/config/RulesPage'
 import TasksPage from './pages/logs/TasksPage'
 import TaskDetailPage from './pages/logs/TaskDetailPage'
 
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="config/models" element={<ModelsPage />} />
         <Route path="config/repositories" element={<RepositoriesPage />} />
         <Route path="config/notify" element={<NotifyPage />} />
+        <Route path="config/rules" element={<RulesPage />} />
         <Route path="tasks" element={<TasksPage />} />
         <Route path="tasks/:taskId" element={<TaskDetailPage />} />
       </Route>

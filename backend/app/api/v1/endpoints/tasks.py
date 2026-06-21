@@ -1,4 +1,4 @@
-"""Task management and log streaming API."""
+"""Task management, push-event pipeline list, and SSE log streaming."""
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,146 @@ from app.models import AITask
 
 router = APIRouter()
 
+
+def _build_pipeline_nodes(task: AITask) -> dict:
+    """Derive per-node status from output_data and overall task status."""
+    od = task.output_data or {}
+    overall = task.status  # pending / running / success / failed
+
+    def _node(key: str, build_fn) -> dict:
+        if key in od:
+            return build_fn(od[key])
+        # Not written yet — infer from overall status
+        if overall in ("pending", "running"):
+            return {"status": "pending"}
+        return {"status": "skipped"}
+
+    def _cr_node(data: dict) -> dict:
+        blocked = data.get("blocked", False)
+        return {
+            "status": "blocked" if blocked else "done",
+            "score": data.get("score"),
+            "findings": len(data.get("findings", [])),
+            "critical_count": data.get("critical_count", 0),
+            "high_count": data.get("high_count", 0),
+        }
+
+    def _tg_node(data: dict) -> dict:
+        wr = data.get("worktree_run", {})
+        wr_status = wr.get("status", "unknown")
+        # "running" when worktree_run key is absent but test_generation key exists
+        return {
+            "status": wr_status if wr_status != "unknown" else "running",
+            "framework": data.get("framework"),
+            "files_count": len(data.get("generated_files", [])),
+            "pytest_status": wr.get("status"),
+            "pytest_passed": _count_from_stdout(wr.get("stdout", ""), "passed"),
+            "pytest_failed": _count_from_stdout(wr.get("stdout", ""), "failed"),
+        }
+
+    def _am_node(data: dict) -> dict:
+        return {
+            "status": "done" if data.get("success") else "failed",
+            "message": data.get("message", ""),
+        }
+
+    cr = _node("code_review", _cr_node)
+    # If overall task is running and code_review is already done, mark tg as running
+    if overall == "running" and cr.get("status") in ("done", "blocked"):
+        tg_default = {"status": "running"}
+    else:
+        tg_default = {"status": "pending"}
+
+    tg = od["test_generation"] and _tg_node(od["test_generation"]) if "test_generation" in od else tg_default
+    am = _node("auto_merge", _am_node)
+
+    return {
+        "code_review": cr,
+        "test_generation": tg,
+        "auto_merge": am,
+        # Phase 2 placeholders
+        "ci_build": {"status": "phase2"},
+        "deploy": {"status": "phase2"},
+    }
+
+
+def _count_from_stdout(stdout: str, keyword: str) -> int:
+    import re
+    m = re.search(rf"(\d+) {keyword}", stdout)
+    return int(m.group(1)) if m else 0
+
+
+def _task_to_event(task: AITask) -> dict:
+    ti = task.trigger_event or {}
+    return {
+        "task_id": task.task_id,
+        "repo_id": task.repo_id,
+        "status": task.status,
+        "branch": ti.get("branch", ""),
+        "commit_sha": (ti.get("commit_sha") or "")[:8],
+        "author": ti.get("author", ""),
+        "prompt_tokens": task.prompt_tokens,
+        "completion_tokens": task.completion_tokens,
+        "duration_ms": task.duration_ms,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "pipeline": _build_pipeline_nodes(task),
+    }
+
+
+# ── Push event list (pipeline chain view) ────────────────────────────────────
+
+@router.get("/events")
+async def list_events(
+    page: int = 1,
+    page_size: int = 20,
+    repo_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    q = (
+        select(AITask)
+        .where(AITask.task_type.in_(["push_event", "code_review"]))  # include legacy type
+        .order_by(desc(AITask.created_at))
+    )
+    if repo_id:
+        q = q.where(AITask.repo_id == repo_id)
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    tasks = (await db.execute(q.offset((page - 1) * page_size).limit(page_size))).scalars().all()
+
+    return {
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+        "items": [_task_to_event(t) for t in tasks],
+    }
+
+
+@router.get("/events/{task_id}/stream")
+async def stream_pipeline(task_id: str, db: AsyncSession = Depends(get_db)):
+    """SSE: poll every 2s and push pipeline node updates until task completes."""
+    async def event_stream():
+        for _ in range(120):  # max 4 minutes
+            task = (await db.execute(
+                select(AITask).where(AITask.task_id == task_id)
+            )).scalar_one_or_none()
+
+            if not task:
+                yield f"data: {json.dumps({'error': 'not found'})}\n\n"
+                break
+
+            payload = _task_to_event(task)
+            yield f"data: {json.dumps(payload)}\n\n"
+
+            if task.status in ("success", "failed"):
+                break
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Task list (existing) ──────────────────────────────────────────────────────
 
 @router.get("")
 async def list_tasks(
@@ -31,11 +171,10 @@ async def list_tasks(
         q = q.where(AITask.repo_id == repo_id)
 
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
-    q = q.offset((page - 1) * page_size).limit(page_size)
-    tasks = (await db.execute(q)).scalars().all()
+    tasks = (await db.execute(q.offset((page - 1) * page_size).limit(page_size))).scalars().all()
 
     return {
-        "total": total,
+        "total": int(total),
         "page": page,
         "page_size": page_size,
         "items": [
@@ -57,43 +196,40 @@ async def list_tasks(
 
 @router.get("/{task_id}")
 async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
-    task = (await db.execute(select(AITask).where(AITask.task_id == task_id))).scalar_one_or_none()
+    task = (await db.execute(
+        select(AITask).where(AITask.task_id == task_id)
+    )).scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return {
-        "task_id": task.task_id,
+        **_task_to_event(task),
         "task_type": task.task_type,
-        "status": task.status,
-        "trigger_event": task.trigger_event,
+        "error_message": task.error_message,
         "input_data": task.input_data,
         "output_data": task.output_data,
-        "error_message": task.error_message,
-        "prompt_tokens": task.prompt_tokens,
-        "completion_tokens": task.completion_tokens,
-        "duration_ms": task.duration_ms,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
     }
 
 
 @router.get("/{task_id}/logs")
 async def stream_task_logs(task_id: str, db: AsyncSession = Depends(get_db)):
-    """SSE endpoint for real-time task log streaming."""
+    """Legacy SSE endpoint kept for compatibility."""
     async def event_stream():
-        for _ in range(60):  # poll up to 60s
-            task = (await db.execute(select(AITask).where(AITask.task_id == task_id))).scalar_one_or_none()
+        for _ in range(60):
+            task = (await db.execute(
+                select(AITask).where(AITask.task_id == task_id)
+            )).scalar_one_or_none()
             if not task:
                 yield f"data: {json.dumps({'error': 'task not found'})}\n\n"
                 break
 
-            data = {"status": task.status, "updated_at": task.updated_at.isoformat() if task.updated_at else None}
+            data = {"status": task.status,
+                    "updated_at": task.updated_at.isoformat() if task.updated_at else None}
             if task.output_data:
                 data["output"] = task.output_data
             if task.error_message:
                 data["error"] = task.error_message
 
             yield f"data: {json.dumps(data)}\n\n"
-
             if task.status in ("success", "failed"):
                 break
             await asyncio.sleep(2)

@@ -70,19 +70,77 @@ def _build_code_review_card(data: dict, context: dict) -> dict:
     }
 
 
-def _build_test_gen_card(data: dict, context: dict) -> dict:
-    """Build card for test generation results."""
+def _parse_pytest_summary(stdout: str) -> tuple[int, int, str]:
+    """Extract (passed, failed, summary_line) from pytest stdout."""
+    import re
+    passed = failed = 0
+    summary_line = ""
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if "passed" in line or "failed" in line or "error" in line:
+            summary_line = line
+            passed_m = re.search(r"(\d+) passed", line)
+            failed_m = re.search(r"(\d+) failed", line)
+            if passed_m:
+                passed = int(passed_m.group(1))
+            if failed_m:
+                failed = int(failed_m.group(1))
+            break
+    return passed, failed, summary_line
+
+
+def _build_test_gen_card(data: dict, context: dict, worktree_run: dict | None = None) -> dict:
+    """Build card for test generation + optional pytest run results."""
     files_count = len(data.get("files", []))
     framework = data.get("framework", "unknown")
     coverage = data.get("estimated_coverage_delta", "N/A")
+
+    # Default state: no pytest run yet
+    pytest_section = ""
+    header_color = "green"
+    header_title = "🧪 AI 单测生成完成"
+
+    if worktree_run:
+        run_status = worktree_run.get("status", "unknown")
+        stdout = worktree_run.get("stdout", "")
+        stderr = worktree_run.get("stderr", "")
+        passed, failed, summary_line = _parse_pytest_summary(stdout)
+
+        if run_status == "passed":
+            pytest_icon = "✅"
+            header_color = "green"
+            header_title = f"🧪 AI 单测生成 — {passed} 个用例全部通过"
+        elif run_status == "failed":
+            pytest_icon = "❌"
+            header_color = "red"
+            header_title = f"🧪 AI 单测生成 — {failed} 个用例失败"
+        else:
+            pytest_icon = "⚠️"
+            header_color = "yellow"
+            header_title = "🧪 AI 单测生成 — 执行异常"
+
+        # Show last meaningful stdout lines (summary + errors)
+        stdout_excerpt = "\n".join(
+            line for line in stdout.splitlines()[-20:]
+            if line.strip() and not line.startswith("cachedir")
+        )[:800]
+
+        pytest_section = (
+            f"\n\n---\n"
+            f"**pytest 执行结果**: {pytest_icon} {run_status.upper()}\n"
+            f"**通过**: {passed} | **失败**: {failed}\n"
+            f"**摘要**: `{summary_line}`"
+        )
+        if failed > 0 and stdout_excerpt:
+            pytest_section += f"\n\n**输出片段**:\n```\n{stdout_excerpt}\n```"
 
     return {
         "msg_type": "interactive",
         "card": {
             "schema": "2.0",
             "header": {
-                "title": {"tag": "plain_text", "content": "🧪 AI 单测生成完成"},
-                "template": "green",
+                "title": {"tag": "plain_text", "content": header_title},
+                "template": header_color,
             },
             "body": {
                 "direction": "vertical",
@@ -95,6 +153,7 @@ def _build_test_gen_card(data: dict, context: dict) -> dict:
                             f"**测试框架**: {framework}\n"
                             f"**生成文件数**: {files_count}\n"
                             f"**预估覆盖率提升**: {coverage}"
+                            f"{pytest_section}"
                         ),
                     }
                 ],
@@ -152,6 +211,7 @@ class FeishuWebhookProvider(NotificationProvider):
             card = _build_test_gen_card(
                 message.data.get("data", {}),
                 message.data.get("context", {}),
+                worktree_run=message.data.get("worktree_run"),
             )
             return {**base, **card}
 

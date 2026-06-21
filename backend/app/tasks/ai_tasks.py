@@ -1,10 +1,15 @@
 """
 Celery tasks for AI processing pipeline.
-Each webhook event maps to one or more tasks here.
+DB operations use synchronous SQLAlchemy (psycopg2) to avoid asyncpg
+event-loop conflicts in Celery's fork-based worker model.
+AI inference is the only async part, isolated in its own short-lived loop.
 """
 import asyncio
 import time
 from datetime import datetime, timezone
+
+from sqlalchemy import create_engine, select, update
+from sqlalchemy.orm import sessionmaker, Session
 
 from .celery_app import celery_app
 from app.core.config import settings
@@ -12,164 +17,299 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Synchronous engine — one per worker process, no event-loop dependency
+_sync_engine = create_engine(settings.DATABASE_SYNC_URL, pool_pre_ping=True)
+SyncSession = sessionmaker(bind=_sync_engine)
 
-def run_async(coro):
-    """Run async coroutine in sync Celery context."""
+
+def _run_async(coro):
+    """Run a single async coroutine in a fresh, self-contained event loop."""
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
         loop.close()
+        asyncio.set_event_loop(None)
+
+
+def _write_partial_output(task_id: str, key: str, value: dict):
+    """Merge one skill result into output_data JSONB while the task is still running.
+    Uses a short-lived psycopg2 connection to avoid sharing state with the main pool.
+    Safe to call from a thread-pool executor inside an async context.
+    """
+    import json as _json
+    import psycopg2
+    dsn = settings.DATABASE_PURE_URL
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ai_tasks "
+                "SET output_data = COALESCE(output_data, '{}') || %s::jsonb, "
+                "    updated_at  = NOW() "
+                "WHERE task_id = %s",
+                (_json.dumps({key: value}), task_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_failed(db: Session, task_id: str, error: str):
+    from app.models import AITask
+    db.execute(
+        update(AITask)
+        .where(AITask.task_id == task_id)
+        .values(status="failed", error_message=error[:2000],
+                updated_at=datetime.now(timezone.utc))
+    )
+    db.commit()
 
 
 @celery_app.task(bind=True, name="ai_tasks.process_push_event", max_retries=2)
 def process_push_event(self, repo_id: int, event_data: dict):
     """Handle push event: run code review on the commit diff."""
-    from app.core.database import AsyncSessionLocal
     from app.models import AITask, AIModel, Repository
-    from app.services.ai.engine import build_engine_from_db_model, AIEngine
-    from app.services.skills.registry import skill_registry
-    from app.services.skills.base import SkillContext
-    from app.services.git.agent import GitAgent
-    from app.services.notify.feishu import build_notify_provider
-    from app.services.notify.base import NotifyMessage
-    from sqlalchemy import select, update
 
     task_id = self.request.id
     start_time = time.time()
 
-    async def _run():
-        async with AsyncSessionLocal() as db:
-            # Update task status to running
-            await db.execute(
-                update(AITask)
-                .where(AITask.task_id == task_id)
-                .values(status="running", updated_at=datetime.now(timezone.utc))
+    with SyncSession() as db:
+        # Mark running
+        db.execute(
+            update(AITask)
+            .where(AITask.task_id == task_id)
+            .values(status="running", updated_at=datetime.now(timezone.utc))
+        )
+        db.commit()
+
+        # Load repo + model + resolve pipeline stages via RuleEngine
+        repo = db.execute(select(Repository).where(Repository.id == repo_id)).scalar_one_or_none()
+        if not repo:
+            _mark_failed(db, task_id, f"Repository {repo_id} not found")
+            return
+
+        model = None
+        if repo.ai_model_id:
+            model = db.execute(select(AIModel).where(AIModel.id == repo.ai_model_id)).scalar_one_or_none()
+
+        from app.services.rules.engine import get_stages_sync
+        branch = event_data.get("branch", "")
+        enabled_stages = get_stages_sync(repo_id, branch, db)
+
+        # Pre-load notify config synchronously — avoids asyncpg inside the async block
+        from app.models import NotifyConfig
+        notify_cfg_row = db.execute(
+            select(NotifyConfig).where(
+                NotifyConfig.is_default == True,
+                NotifyConfig.enabled == True,
             )
-            await db.commit()
+        ).scalar_one_or_none()
+        notify_cfg = (
+            {"provider": notify_cfg_row.provider, "config": notify_cfg_row.config}
+            if notify_cfg_row else None
+        )
 
-            # Load repo config
-            repo = (await db.execute(select(Repository).where(Repository.id == repo_id))).scalar_one_or_none()
-            if not repo:
-                raise ValueError(f"Repository {repo_id} not found")
+    try:
+        # ── Async block: git + AI inference only, no DB ────────────────
+        output = _run_async(_ai_pipeline(repo, model, event_data, task_id, notify_cfg, enabled_stages))
+        # ──────────────────────────────────────────────────────────────
 
-            # Load AI model
-            model = None
-            if repo.ai_model_id:
-                model = (await db.execute(select(AIModel).where(AIModel.id == repo.ai_model_id))).scalar_one_or_none()
-
-            engine = build_engine_from_db_model(model) if model else AIEngine()
-
-            # Get diff
-            from app.core.security import decrypt
-            git_token = decrypt(repo.git_token_encrypted) if repo.git_token_encrypted else None
-            git_agent = GitAgent(repo.repo_url, git_token)
-
-            commit_sha = event_data.get("commit_sha", "")
-            before_sha = event_data.get("before_sha", "")
-
-            if before_sha and before_sha != "0" * 40:
-                diff, changed_files = git_agent.get_diff(before_sha, commit_sha)
-            else:
-                diff, changed_files = git_agent.get_commit_diff(commit_sha)
-
-            context = SkillContext(
-                repo_id=repo_id,
-                repo_url=repo.repo_url,
-                platform=repo.platform,
-                branch=event_data.get("branch", ""),
-                commit_sha=commit_sha,
-                author=event_data.get("author", ""),
-                diff=diff,
-                changed_files=changed_files,
-            )
-
-            # Execute code review skill
-            result = await skill_registry.execute("code_review", context, engine)
-
-            # Execute test generation if enabled
-            skills_cfg = repo.skills_config or {}
-            if skills_cfg.get("test_generation", {}).get("enabled", True):
-                test_result = await skill_registry.execute("test_generation", context, engine)
-
-                if test_result.success and test_result.details.get("generated_files"):
-                    # Run tests in WorkTree
-                    with git_agent.create_worktree(context.branch) as wt:
-                        wt.write_files(test_result.details["generated_files"])
-                        run_cmd = test_result.details.get("run_command", "")
-                        if run_cmd:
-                            run_out = wt.run_command(run_cmd)
-                            test_result.details["worktree_run"] = run_out
-
-                # Send test gen notification
-                for notif in test_result.notifications:
-                    await _send_notification(db, notif)
-
-            # Send code review notification
-            for notif in result.notifications:
-                await _send_notification(db, notif)
-
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            # Update task record
-            await db.execute(
+        duration_ms = int((time.time() - start_time) * 1000)
+        with SyncSession() as db:
+            db.execute(
                 update(AITask)
                 .where(AITask.task_id == task_id)
                 .values(
                     status="success",
-                    output_data=result.details,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
+                    output_data=output.get("output_data"),
+                    prompt_tokens=output.get("prompt_tokens", 0),
+                    completion_tokens=output.get("completion_tokens", 0),
                     duration_ms=duration_ms,
                     updated_at=datetime.now(timezone.utc),
                 )
             )
-            await db.commit()
+            db.commit()
+        logger.info("task.completed", task_id=task_id, duration_ms=duration_ms)
 
-            logger.info("task.push_completed", task_id=task_id, duration_ms=duration_ms)
-
-    async def _send_notification(db, notif_data: dict):
-        from app.models import NotifyConfig
-        from sqlalchemy import select as sa_select
-        notify_cfg = (await db.execute(
-            sa_select(NotifyConfig).where(NotifyConfig.is_default == True, NotifyConfig.enabled == True)
-        )).scalar_one_or_none()
-
-        if not notify_cfg:
-            return
-
-        try:
-            provider = build_notify_provider({
-                "provider": notify_cfg.provider,
-                "config": notify_cfg.config,
-            })
-            msg = NotifyMessage(
-                title=notif_data.get("type", "AI DevOps 通知"),
-                content="",
-                message_type=notif_data.get("type", "generic"),
-                data=notif_data,
-                color="green",
-            )
-            await provider.send(msg)
-        except Exception as e:
-            logger.warning("notification.failed", error=str(e))
-
-    try:
-        run_async(_run())
     except Exception as exc:
-        logger.exception("task.push_failed", task_id=task_id, error=str(exc))
-        run_async(_mark_failed(task_id, str(exc)))
+        logger.exception("task.failed", task_id=task_id, error=str(exc))
+        with SyncSession() as db:
+            _mark_failed(db, task_id, str(exc))
         raise self.retry(exc=exc, countdown=30)
 
 
-async def _mark_failed(task_id: str, error: str):
-    from app.core.database import AsyncSessionLocal
-    from app.models import AITask
-    from sqlalchemy import update
-    async with AsyncSessionLocal() as db:
-        await db.execute(
-            update(AITask)
-            .where(AITask.task_id == task_id)
-            .values(status="failed", error_message=error[:2000])
+async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None) -> dict:
+    """Pure async: git diff + AI skills + notifications. No DB access."""
+    from app.services.ai.engine import build_engine_from_db_model, AIEngine
+    from app.services.skills.registry import skill_registry
+    from app.services.skills.base import SkillContext
+    from app.services.git.agent import GitAgent
+    from app.core.security import decrypt
+
+    engine = build_engine_from_db_model(model) if model else AIEngine()
+
+    git_token = decrypt(repo.git_token_encrypted) if repo.git_token_encrypted else None
+    git_agent = GitAgent(repo.repo_url, git_token)
+
+    commit_sha = event_data.get("commit_sha", "")
+    before_sha = event_data.get("before_sha", "")
+
+    # Fetch/clone repo
+    git_agent.ensure_repo()
+
+    all_zeros = "0" * 40
+    if before_sha and before_sha != all_zeros and commit_sha and commit_sha != all_zeros:
+        diff, changed_files = git_agent.get_diff(before_sha, commit_sha)
+    elif commit_sha and commit_sha != all_zeros:
+        diff, changed_files = git_agent.get_commit_diff(commit_sha)
+    else:
+        # No valid SHA (e.g. test webhook) — diff HEAD against parent
+        try:
+            diff, changed_files = git_agent.get_latest_diff()
+        except Exception:
+            diff, changed_files = "", []
+
+    if not diff.strip():
+        logger.info("task.no_diff", task_id=task_id)
+        return {"output_data": {"summary": "No diff to review"}, "prompt_tokens": 0, "completion_tokens": 0}
+
+    context = SkillContext(
+        repo_id=repo.id,
+        repo_url=repo.repo_url,
+        platform=repo.platform,
+        branch=event_data.get("branch", ""),
+        commit_sha=commit_sha,
+        author=event_data.get("author", ""),
+        diff=diff,
+        changed_files=changed_files,
+    )
+
+    stages = set(enabled_stages or ["code_review"])
+    skills_config = repo.skills_config or {}
+    pt = ct = 0
+    output_data: dict = {}
+    loop = asyncio.get_event_loop()
+
+    async def _persist(key: str, val: dict):
+        output_data[key] = val
+        await loop.run_in_executor(None, _write_partial_output, task_id, key, val)
+
+    # ── Code review ───────────────────────────────────────────────────────
+    if "code_review" not in stages:
+        logger.info("stage.skipped", stage="code_review")
+        await _persist("code_review", {"status": "skipped"})
+    else:
+        cr = await skill_registry.execute("code_review", context, engine)
+        pt += cr.prompt_tokens; ct += cr.completion_tokens
+        await _persist("code_review", cr.details)
+        for notif in cr.notifications:
+            await _send_notification(notif, notify_cfg)
+
+    # ── Test generation ───────────────────────────────────────────────────
+    if "test_generation" not in stages:
+        logger.info("stage.skipped", stage="test_generation")
+        await _persist("test_generation", {"status": "skipped"})
+    else:
+        test_cfg = skills_config.get("test_generation", {})
+        tg = await skill_registry.execute(
+            "test_generation", context, engine,
+            skill_config={k: v for k, v in test_cfg.items() if k != "enabled"},
         )
-        await db.commit()
+        pt += tg.prompt_tokens; ct += tg.completion_tokens
+        tg_details = dict(tg.details)
+        files = tg_details.get("generated_files", [])
+        cmd   = tg_details.get("run_command") or "pytest tests/ -v"
+
+        if files:
+            wr = await _run_worktree_tests(git_agent, context.branch or commit_sha, files, cmd)
+        else:
+            wr = {"status": "skipped", "reason": "no files generated"}
+
+        tg_details["worktree_run"] = wr
+        await _persist("test_generation", tg_details)
+        for notif in tg.notifications:
+            await _send_notification(
+                {**notif, "data": {**notif.get("data", {}), "worktree_run": wr}},
+                notify_cfg,
+            )
+
+    return {"output_data": output_data, "prompt_tokens": pt, "completion_tokens": ct}
+
+
+async def _run_worktree_tests(
+    git_agent,
+    branch_or_sha: str,
+    generated_files: list[dict],
+    run_command: str,
+    timeout: int = 60,
+) -> dict:
+    """
+    Create an isolated WorkTree, write AI-generated test files, run pytest, return results.
+    WorkTree is always cleaned up, even on error.
+    """
+    import asyncio
+    worktree = None
+    try:
+        worktree = git_agent.create_worktree(branch_or_sha)
+        # conftest.py makes the repo root importable so `from main import x` works
+        conftest = [{
+            "path": "conftest.py",
+            "content": (
+                "import sys, os\n"
+                "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+            ),
+        }]
+        worktree.write_files(conftest + generated_files)
+
+        # subprocess.run is blocking — offload to thread so event loop stays live
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: worktree.run_command(run_command, timeout=timeout)
+        )
+        logger.info(
+            "worktree.pytest_done",
+            exit_code=result["exit_code"],
+            success=result["success"],
+        )
+        return {
+            "status": "passed" if result["success"] else "failed",
+            "exit_code": result["exit_code"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "run_command": run_command,
+        }
+    except Exception as exc:
+        logger.warning("worktree.pytest_error", error=str(exc))
+        return {"status": "error", "error": str(exc), "run_command": run_command}
+    finally:
+        if worktree:
+            try:
+                worktree.cleanup()
+            except Exception:
+                pass
+
+
+async def _send_notification(notif_data: dict, notify_cfg: dict | None):
+    """Send notification. notify_cfg is pre-loaded synchronously by the Celery task."""
+    if not notify_cfg:
+        return
+    from app.services.notify.feishu import build_notify_provider
+    from app.services.notify.base import NotifyMessage
+    try:
+        provider = build_notify_provider(notify_cfg)
+        msg = NotifyMessage(
+            title=notif_data.get("type", "AI DevOps 通知"),
+            content="",
+            message_type=notif_data.get("type", "generic"),
+            data=notif_data,
+            color="green",
+        )
+        await provider.send(msg)
+    except Exception as e:
+        logger.warning("notification.failed", error=str(e))

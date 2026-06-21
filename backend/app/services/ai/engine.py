@@ -24,6 +24,7 @@ class AIResponse:
 @dataclass
 class ModelConfig:
     model_id: str
+    provider: str = ""
     api_base: Optional[str] = None
     api_key: Optional[str] = None
     temperature: float = 0.3
@@ -47,6 +48,23 @@ class AIEngine:
             api_key=settings.DEFAULT_AI_API_KEY,
         )
 
+    @staticmethod
+    def _resolve_litellm_model(model_id: str, api_base: Optional[str], provider: str = "") -> str:
+        """
+        LiteLLM requires a provider prefix for models it doesn't recognize.
+        - If model already has a slash (e.g. 'deepseek/deepseek-chat'), use as-is.
+        - If api_base is set, treat as an OpenAI-compatible endpoint: prefix 'openai/'.
+          This lets any model name (incl. new ones like deepseek-v4-flash) pass through.
+        - Otherwise, fall back to provider prefix if available.
+        """
+        if "/" in model_id:
+            return model_id
+        if api_base:
+            return f"openai/{model_id}"
+        if provider:
+            return f"{provider}/{model_id}"
+        return model_id
+
     async def complete(
         self,
         messages: list[dict],
@@ -54,8 +72,11 @@ class AIEngine:
         max_tokens: Optional[int] = None,
     ) -> AIResponse:
         cfg = self.model_config
+        resolved_model = self._resolve_litellm_model(
+            cfg.model_id, cfg.api_base, getattr(cfg, "provider", "")
+        )
         kwargs = {
-            "model": cfg.model_id,
+            "model": resolved_model,
             "messages": messages,
             "temperature": temperature or cfg.temperature,
             "max_tokens": max_tokens or cfg.max_tokens,
@@ -66,7 +87,7 @@ class AIEngine:
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
 
-        logger.info("ai_engine.calling", model=cfg.model_id, messages_count=len(messages))
+        logger.info("ai_engine.calling", model=resolved_model, messages_count=len(messages))
 
         response = await litellm.acompletion(**kwargs)
         choice = response.choices[0]
@@ -106,6 +127,7 @@ def build_engine_from_db_model(db_model) -> AIEngine:
 
     config = ModelConfig(
         model_id=db_model.model_id,
+        provider=db_model.provider or "",
         api_base=db_model.api_base,
         api_key=decrypt(db_model.api_key_encrypted) if db_model.api_key_encrypted else None,
         temperature=db_model.config.get("temperature", 0.3),

@@ -1,0 +1,175 @@
+/* ─── Pipeline animation keyframes ─────────────────────────────────────── */
+
+/* Pulse / breathing-light for Running nodes */
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0   rgba(22, 119, 255, 0.55); }
+  70%  { box-shadow: 0 0 0 8px rgba(22, 119, 255, 0);    }
+  100% { box-shadow: 0 0 0 0   rgba(22, 119, 255, 0);    }
+}
+
+/* Icon spin for Running */
+@keyframes spin {
+  from { transform: rotate(0deg);   }
+  to   { transform: rotate(360deg); }
+}
+
+/* Bounce / check-mark pop for Success */
+@keyframes bounce-in {
+  0%   { transform: scale(0.6); opacity: 0.4; }
+  60%  { transform: scale(1.2); opacity: 1;   }
+  80%  { transform: scale(0.95); }
+  100% { transform: scale(1);    }
+}
+
+/* Shake for Failed */
+@keyframes shake {
+  0%, 100% { transform: translateX(0);   }
+  20%       { transform: translateX(-5px); }
+  40%       { transform: translateX( 5px); }
+  60%       { transform: translateX(-4px); }
+  80%       { transform: translateX( 4px); }
+}
+
+/* Fade-in for Skipped nodes */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Flow-light connector between nodes */
+@keyframes flow-right {
+  0%   { background-position: -100% 0; }
+  100% { background-position:  200% 0; }
+}
+
+/* ─── Node dot states ───────────────────────────────────────────────────── */
+
+.pipeline-node-running .pipeline-dot {
+  animation: pulse-ring 1.4s ease-out infinite;
+  border-color: #1677ff !important;
+  background: #e6f4ff !important;
+}
+
+.pipeline-node-running .pipeline-icon {
+  animation: spin 1s linear infinite;
+  color: #1677ff;
+}
+
+.pipeline-node-done .pipeline-dot,
+.pipeline-node-passed .pipeline-dot {
+  animation: bounce-in 0.45s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  background: #52c41a !important;
+  border-color: #52c41a !important;
+}
+
+.pipeline-node-done .pipeline-icon,
+.pipeline-node-passed .pipeline-icon {
+  color: #fff;
+}
+
+.pipeline-node-failed .pipeline-dot,
+.pipeline-node-blocked .pipeline-dot {
+  animation: shake 0.4s ease-in-out;
+  background: #ff4d4f !important;
+  border-color: #ff4d4f !important;
+}
+
+.pipeline-node-failed .pipeline-icon,
+.pipeline-node-blocked .pipeline-icon {
+  color: #fff;
+}
+
+.pipeline-node-skipped {
+  animation: fade-in 0.5s ease both;
+  opacity: 0.45;
+}
+
+.pipeline-node-phase2 {
+  opacity: 0.3;
+}
+
+/* ─── Connector line flow effect ────────────────────────────────────────── */
+
+.pipeline-connector {
+  position: relative;
+  height: 2px;
+  background: #e8e8e8;
+  border-radius: 1px;
+  overflow: hidden;
+  flex: 1;
+  margin: 0 4px;
+  align-self: center;
+}
+
+.pipeline-connector.flowing::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    #1677ff    40%,
+    #69b1ff    60%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: flow-right 1.2s linear infinite;
+}
+
+.pipeline-connector.done {
+  background: #52c41a;
+}
+
+.pipeline-connector.failed {
+  background: #ff4d4f;
+}
+
+/* ─── Full pipeline row layout ──────────────────────────────────────────── */
+
+.pipeline-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  padding: 4px 0;
+  overflow-x: auto;
+}
+
+.pipeline-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 72px;
+  max-width: 100px;
+  cursor: default;
+}
+
+.pipeline-dot {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 2px solid #d9d9d9;
+  background: #fafafa;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  transition: background 0.3s, border-color 0.3s;
+  position: relative;
+  z-index: 1;
+}
+
+.pipeline-node-label {
+  font-size: 11px;
+  color: #8c8c8c;
+  margin-top: 5px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.pipeline-node-desc {
+  font-size: 10px;
+  color: #bfbfbf;
+  text-align: center;
+  margin-top: 2px;
+  white-space: nowrap;
+}

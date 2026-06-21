@@ -30,4 +30,11 @@ export const deleteNotify = (id: number) => api.delete(`/api/v1/notify-configs/$
 export const listTasks = (params?: any) => api.get('/api/v1/tasks', { params }).then(r => r.data)
 export const getTask = (taskId: string) => api.get(`/api/v1/tasks/${taskId}`).then(r => r.data)
 
+// ── Push event pipeline list ───────────────────────────────────────────
+export const listEvents = (params?: any) => api.get('/api/v1/tasks/events', { params }).then(r => r.data)
+
+/** Subscribe to live pipeline updates via SSE. Returns an EventSource. */
+export const streamEvent = (taskId: string): EventSource =>
+  new EventSource(`/api/v1/tasks/events/${taskId}/stream`)
+
 export default api
