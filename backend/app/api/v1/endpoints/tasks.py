@@ -7,7 +7,7 @@ from typing import Optional
 import asyncio
 import json
 
-from app.core.database import get_db
+from app.core.database import get_db, AsyncSessionLocal
 from app.models import AITask
 
 router = APIRouter()
@@ -128,22 +128,27 @@ async def list_events(
 
 
 @router.get("/events/{task_id}/stream")
-async def stream_pipeline(task_id: str, db: AsyncSession = Depends(get_db)):
-    """SSE: poll every 2s and push pipeline node updates until task completes."""
+async def stream_pipeline(task_id: str):
+    """SSE: poll every 2s and push pipeline node updates until task completes.
+
+    Uses a short-lived session per poll instead of holding one connection open for
+    the whole stream — long-lived SSE clients would otherwise exhaust the pool.
+    """
     async def event_stream():
         for _ in range(120):  # max 4 minutes
-            task = (await db.execute(
-                select(AITask).where(AITask.task_id == task_id)
-            )).scalar_one_or_none()
+            async with AsyncSessionLocal() as db:
+                task = (await db.execute(
+                    select(AITask).where(AITask.task_id == task_id)
+                )).scalar_one_or_none()
+                payload = _task_to_event(task) if task else None
 
-            if not task:
+            if payload is None:
                 yield f"data: {json.dumps({'error': 'not found'})}\n\n"
                 break
 
-            payload = _task_to_event(task)
             yield f"data: {json.dumps(payload)}\n\n"
 
-            if task.status in ("success", "failed"):
+            if payload["status"] in ("success", "failed"):
                 break
             await asyncio.sleep(2)
 
@@ -211,26 +216,30 @@ async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{task_id}/logs")
-async def stream_task_logs(task_id: str, db: AsyncSession = Depends(get_db)):
-    """Legacy SSE endpoint kept for compatibility."""
+async def stream_task_logs(task_id: str):
+    """Legacy SSE endpoint kept for compatibility. Short-lived session per poll."""
     async def event_stream():
         for _ in range(60):
-            task = (await db.execute(
-                select(AITask).where(AITask.task_id == task_id)
-            )).scalar_one_or_none()
-            if not task:
+            async with AsyncSessionLocal() as db:
+                task = (await db.execute(
+                    select(AITask).where(AITask.task_id == task_id)
+                )).scalar_one_or_none()
+                if not task:
+                    data = None
+                else:
+                    data = {"status": task.status,
+                            "updated_at": task.updated_at.isoformat() if task.updated_at else None}
+                    if task.output_data:
+                        data["output"] = task.output_data
+                    if task.error_message:
+                        data["error"] = task.error_message
+
+            if data is None:
                 yield f"data: {json.dumps({'error': 'task not found'})}\n\n"
                 break
 
-            data = {"status": task.status,
-                    "updated_at": task.updated_at.isoformat() if task.updated_at else None}
-            if task.output_data:
-                data["output"] = task.output_data
-            if task.error_message:
-                data["error"] = task.error_message
-
             yield f"data: {json.dumps(data)}\n\n"
-            if task.status in ("success", "failed"):
+            if data["status"] in ("success", "failed"):
                 break
             await asyncio.sleep(2)
 

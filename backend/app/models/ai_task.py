@@ -9,9 +9,9 @@ class AITask(Base):
 
     id = Column(Integer, primary_key=True)
     task_id = Column(String(100), unique=True, nullable=False)  # Celery task ID
-    repo_id = Column(Integer, ForeignKey("repositories.id"), nullable=True)
+    repo_id = Column(Integer, ForeignKey("repositories.id"), nullable=True, index=True)
     task_type = Column(String(50), nullable=False)  # code_review/test_generation/auto_merge
-    status = Column(String(20), nullable=False, default="pending")  # pending/running/success/failed
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending/running/success/failed
     trigger_event = Column(JSONB)           # raw webhook event
     input_data = Column(JSONB)
     output_data = Column(JSONB)
@@ -19,5 +19,5 @@ class AITask(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     duration_ms = Column(Integer)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

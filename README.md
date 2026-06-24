@@ -59,6 +59,36 @@ npm run dev
 ```bash
 cd backend
 python -m pytest tests/ -v
+# 或在容器内： docker compose exec api python -m pytest tests/ -q
+```
+
+## 环境变量与密钥
+
+加密密钥用于加密存储 Git Token / AI API Key，**api 与 worker 必须使用同一个值**。
+仓库内的默认值仅供本地调试；非 DEBUG 模式下若仍为默认值，应用会拒绝启动。
+
+```bash
+cp .env.example .env        # docker compose 会自动读取根目录 .env
+# 生成强随机值：
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+| 变量 | 说明 |
+|------|------|
+| `ENCRYPTION_KEY` | Fernet/AES 密钥，加密 Token/API Key（api、worker 必须一致） |
+| `SECRET_KEY` | 应用签名密钥 |
+| `SQL_ECHO` | 设为 `true` 打印所有 SQL（默认关闭，已与 DEBUG 解耦） |
+
+## 数据库迁移（Alembic）
+
+DEBUG 模式下应用启动时自动 `create_all` 建表（本地便利）。其它环境以 Alembic 迁移为准：
+
+```bash
+cd backend
+alembic upgrade head                          # 应用迁移
+alembic revision --autogenerate -m "xxx"      # 模型变更后生成新迁移
+# 已用 create_all 建过表的库，首次接入迁移先打标记：
+alembic stamp head
 ```
 
 ## 分支规则配置指南

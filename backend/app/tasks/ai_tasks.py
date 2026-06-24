@@ -21,6 +21,20 @@ logger = structlog.get_logger()
 _sync_engine = create_engine(settings.DATABASE_SYNC_URL, pool_pre_ping=True)
 SyncSession = sessionmaker(bind=_sync_engine)
 
+# Whitelist of test runners we will execute in a WorkTree. Keyed by the framework
+# name the LLM reports. Values are fixed argv lists run WITHOUT a shell — the
+# LLM's own run_command string is intentionally ignored. Frameworks absent here
+# are not executed (test files are still generated and reported).
+SAFE_TEST_COMMANDS: dict[str, list[str]] = {
+    "pytest": ["pytest", "-q"],
+    "python": ["pytest", "-q"],
+    "unittest": ["python", "-m", "pytest", "-q"],
+}
+
+
+def _safe_test_command(framework: str | None) -> list[str] | None:
+    return SAFE_TEST_COMMANDS.get((framework or "").strip().lower())
+
 
 def _run_async(coro):
     """Run a single async coroutine in a fresh, self-contained event loop."""
@@ -138,9 +152,14 @@ def process_push_event(self, repo_id: int, event_data: dict):
         logger.info("task.completed", task_id=task_id, duration_ms=duration_ms)
 
     except Exception as exc:
-        logger.exception("task.failed", task_id=task_id, error=str(exc))
-        with SyncSession() as db:
-            _mark_failed(db, task_id, str(exc))
+        logger.exception("task.failed", task_id=task_id,
+                         attempt=self.request.retries, error=str(exc))
+        # Only persist a terminal "failed" state once retries are exhausted, so the
+        # status doesn't flicker failed -> running across transient retries.
+        if self.request.retries >= self.max_retries:
+            with SyncSession() as db:
+                _mark_failed(db, task_id, str(exc))
+            raise
         raise self.retry(exc=exc, countdown=30)
 
 
@@ -224,10 +243,16 @@ async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: 
         pt += tg.prompt_tokens; ct += tg.completion_tokens
         tg_details = dict(tg.details)
         files = tg_details.get("generated_files", [])
-        cmd   = tg_details.get("run_command") or "pytest tests/ -v"
+        # SECURITY: never execute the LLM-provided run_command. Derive a fixed,
+        # whitelisted argv from the detected framework instead (avoids shell injection
+        # via a prompt-injected diff). Frameworks we can't safely run are skipped.
+        cmd = _safe_test_command(tg_details.get("framework"))
 
-        if files:
+        if files and cmd:
             wr = await _run_worktree_tests(git_agent, context.branch or commit_sha, files, cmd)
+        elif files and not cmd:
+            wr = {"status": "skipped",
+                  "reason": f"framework '{tg_details.get('framework')}' not runnable in sandbox"}
         else:
             wr = {"status": "skipped", "reason": "no files generated"}
 
@@ -246,14 +271,16 @@ async def _run_worktree_tests(
     git_agent,
     branch_or_sha: str,
     generated_files: list[dict],
-    run_command: str,
+    run_command: list[str],
     timeout: int = 60,
 ) -> dict:
     """
-    Create an isolated WorkTree, write AI-generated test files, run pytest, return results.
+    Create an isolated WorkTree, write AI-generated test files, run a whitelisted
+    test command (argv list, no shell), return results.
     WorkTree is always cleaned up, even on error.
     """
     import asyncio
+    cmd_display = " ".join(run_command)
     worktree = None
     try:
         worktree = git_agent.create_worktree(branch_or_sha)
@@ -282,17 +309,32 @@ async def _run_worktree_tests(
             "exit_code": result["exit_code"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
-            "run_command": run_command,
+            "run_command": cmd_display,
         }
     except Exception as exc:
         logger.warning("worktree.pytest_error", error=str(exc))
-        return {"status": "error", "error": str(exc), "run_command": run_command}
+        return {"status": "error", "error": str(exc), "run_command": cmd_display}
     finally:
         if worktree:
             try:
                 worktree.cleanup()
             except Exception:
                 pass
+
+
+def _notification_color(notif_data: dict) -> str:
+    """Pick a card color reflecting the actual outcome (not always green)."""
+    ntype = notif_data.get("type")
+    data = notif_data.get("data", {}) or {}
+    if ntype == "code_review_result":
+        return "red" if data.get("blocked") else "green"
+    if ntype == "test_generation_result":
+        status = (data.get("worktree_run") or {}).get("status")
+        if status in ("failed", "error"):
+            return "red"
+        if status not in ("passed", None):
+            return "yellow"
+    return "green"
 
 
 async def _send_notification(notif_data: dict, notify_cfg: dict | None):
@@ -308,7 +350,7 @@ async def _send_notification(notif_data: dict, notify_cfg: dict | None):
             content="",
             message_type=notif_data.get("type", "generic"),
             data=notif_data,
-            color="green",
+            color=_notification_color(notif_data),
         )
         await provider.send(msg)
     except Exception as e:

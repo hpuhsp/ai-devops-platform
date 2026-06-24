@@ -5,6 +5,7 @@ celery_app = Celery(
     "ai_devops",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    include=["app.tasks.ai_tasks"],
 )
 
 celery_app.conf.update(
@@ -18,4 +19,3 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,   # fair dispatch for long AI tasks
 )
 
-celery_app.autodiscover_tasks(["app.tasks"])

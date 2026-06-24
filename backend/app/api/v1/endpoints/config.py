@@ -8,6 +8,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import encrypt, decrypt
 from app.models import AIModel, Repository, NotifyConfig
+from app.services.git.webhook_parser import _normalize_url
 
 router = APIRouter()
 
@@ -127,7 +128,7 @@ async def create_repo(body: RepoCreate, db: AsyncSession = Depends(get_db)):
     repo = Repository(
         name=body.name,
         platform=body.platform,
-        repo_url=body.repo_url,
+        repo_url=_normalize_url(body.repo_url),
         webhook_secret=body.webhook_secret,
         git_token_encrypted=encrypt(body.git_token) if body.git_token else None,
         branch_rules=body.branch_rules,
@@ -149,7 +150,7 @@ async def update_repo(repo_id: int, body: RepoCreate, db: AsyncSession = Depends
 
     repo.name = body.name
     repo.platform = body.platform
-    repo.repo_url = body.repo_url
+    repo.repo_url = _normalize_url(body.repo_url)
     if body.webhook_secret:
         repo.webhook_secret = body.webhook_secret
     if body.git_token:

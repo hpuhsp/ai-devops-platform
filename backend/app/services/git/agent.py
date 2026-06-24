@@ -28,12 +28,15 @@ class GitAgent:
         WORKTREE_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _build_auth_url(self) -> str:
-        """Inject token into HTTPS URL for authentication."""
+        """Inject token into HTTPS URL for authentication. Ensure .git suffix for clone."""
+        url = self.repo_url
+        if not url.endswith(".git"):
+            url = url + ".git"
         if not self.git_token:
-            return self.repo_url
-        if self.repo_url.startswith("https://"):
-            return self.repo_url.replace("https://", f"https://oauth2:{self.git_token}@")
-        return self.repo_url
+            return url
+        if url.startswith("https://"):
+            return url.replace("https://", f"https://oauth2:{self.git_token}@")
+        return url
 
     def _run(self, cmd: list[str], cwd: str = None, check: bool = True) -> subprocess.CompletedProcess:
         logger.debug("git.run", cmd=" ".join(cmd), cwd=cwd)
@@ -48,13 +51,22 @@ class GitAgent:
     def ensure_repo(self) -> Path:
         """Clone repo if not exists, otherwise fetch latest."""
         if self.local_path.exists():
-            self._run(["git", "fetch", "--all", "--prune"])
-            logger.info("git.fetched", path=str(self.local_path))
+            result = self._run(["git", "fetch", "--all", "--prune"], check=False)
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                if "couldn't find remote ref" in stderr or "does not have any commits" in stderr:
+                    logger.info("git.fetch_empty_repo", path=str(self.local_path))
+                else:
+                    raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
+            else:
+                logger.info("git.fetched", path=str(self.local_path))
         else:
-            self._run(
+            result = self._run(
                 ["git", "clone", "--bare", self._authenticated_url, str(self.local_path)],
-                cwd="/tmp",
+                cwd="/tmp", check=False,
             )
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
             logger.info("git.cloned", url=self.repo_url, path=str(self.local_path))
         return self.local_path
 
@@ -81,6 +93,21 @@ class GitAgent:
         files_result = self._run(["git", "diff-tree", "--no-commit-id", "-r", "--name-only", commit_sha])
         changed_files = [f for f in files_result.stdout.strip().split("\n") if f]
         return diff_result.stdout, changed_files
+
+    def get_latest_diff(self) -> tuple[str, list[str]]:
+        """Get diff of the latest commit (HEAD vs HEAD~1). Fallback for test webhooks."""
+        self.ensure_repo()
+        # Check how many commits exist
+        count_result = self._run(["git", "rev-list", "--count", "--all"], check=False)
+        count = int(count_result.stdout.strip() or "0")
+        if count == 0:
+            return "", []
+        if count == 1:
+            # Only one commit — show it as the full diff
+            sha = self._run(["git", "rev-list", "--all"]).stdout.strip().splitlines()[0]
+            return self.get_commit_diff(sha)
+        head = self._run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        return self.get_commit_diff(head)
 
     def create_worktree(self, branch: str) -> "WorkTree":
         """Create an isolated worktree for test execution."""
@@ -159,13 +186,19 @@ class WorkTree:
         logger.info("worktree.files_written", count=len(written))
         return written
 
-    def run_command(self, command: str, timeout: int = 120) -> dict:
-        """Run a shell command in the worktree (e.g., pytest)."""
-        logger.info("worktree.run", command=command, path=str(self.path))
+    def run_command(self, command, timeout: int = 120) -> dict:
+        """Run a command in the worktree (e.g., pytest).
+
+        Prefer an argv list (executed WITHOUT a shell) so untrusted input can't be
+        interpreted by the shell. A plain string still works but uses shell=True and
+        must only ever be a trusted constant.
+        """
+        use_shell = isinstance(command, str)
+        logger.info("worktree.run", command=command, shell=use_shell, path=str(self.path))
         try:
             result = subprocess.run(
                 command,
-                shell=True,
+                shell=use_shell,
                 cwd=str(self.path),
                 capture_output=True,
                 text=True,

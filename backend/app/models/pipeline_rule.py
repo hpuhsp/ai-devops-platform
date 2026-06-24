@@ -14,7 +14,7 @@ class PipelineRule(Base):
     __tablename__ = "pipeline_rules"
 
     id       = Column(Integer, primary_key=True)
-    repo_id  = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
+    repo_id  = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
     name     = Column(String(100), nullable=False)
     pattern  = Column(String(200), nullable=False)   # fnmatch pattern, e.g. feature/*
     stages   = Column(JSONB, nullable=False, default=["code_review"])

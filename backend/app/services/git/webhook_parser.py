@@ -5,6 +5,16 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+def _normalize_url(url: str) -> str:
+    """Strip .git suffix, trailing slash, and URL fragment for consistent matching."""
+    if not url:
+        return url
+    url = url.split("#")[0].rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url
+
+
 @dataclass
 class WebhookEvent:
     platform: str           # gitlab/github/gitea
@@ -23,6 +33,20 @@ class WebhookEvent:
     raw_payload: dict = None
 
 
+def _gitlab_repo_url(payload: dict) -> str:
+    """Extract git_http_url from GitLab payload.
+    Test webhooks only have 'project'; real push events have both 'repository' and 'project'.
+    """
+    url = (
+        payload.get("repository", {}).get("git_http_url")
+        or payload.get("project", {}).get("git_http_url")
+        or payload.get("project", {}).get("http_url")
+        or payload.get("repository", {}).get("url")
+        or ""
+    )
+    return _normalize_url(url)
+
+
 def parse_gitlab(payload: dict, event_header: str) -> WebhookEvent:
     event_type = {
         "Push Hook": "push",
@@ -34,7 +58,7 @@ def parse_gitlab(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="gitlab",
             event_type="push",
-            repo_url=payload["repository"]["git_http_url"],
+            repo_url=_gitlab_repo_url(payload),
             branch=payload.get("ref", "").replace("refs/heads/", ""),
             commit_sha=payload.get("after", ""),
             before_sha=payload.get("before", ""),
@@ -47,7 +71,7 @@ def parse_gitlab(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="gitlab",
             event_type=f"mr_{attrs.get('action', 'open')}",
-            repo_url=payload["repository"]["git_http_url"],
+            repo_url=_gitlab_repo_url(payload),
             branch=attrs.get("source_branch", ""),
             commit_sha=attrs.get("last_commit", {}).get("id", ""),
             author=payload.get("user", {}).get("name", ""),
@@ -62,7 +86,7 @@ def parse_gitlab(payload: dict, event_header: str) -> WebhookEvent:
     return WebhookEvent(
         platform="gitlab",
         event_type=event_type,
-        repo_url=payload.get("repository", {}).get("git_http_url", ""),
+        repo_url=_gitlab_repo_url(payload),
         branch="",
         commit_sha="",
         author="",
@@ -76,7 +100,7 @@ def parse_github(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="github",
             event_type="push",
-            repo_url=payload["repository"]["clone_url"],
+            repo_url=_normalize_url(payload["repository"]["clone_url"]),
             branch=payload.get("ref", "").replace("refs/heads/", ""),
             commit_sha=payload.get("after", ""),
             before_sha=payload.get("before", ""),
@@ -89,7 +113,7 @@ def parse_github(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="github",
             event_type=f"mr_{payload.get('action', 'open')}",
-            repo_url=payload["repository"]["clone_url"],
+            repo_url=_normalize_url(payload["repository"]["clone_url"]),
             branch=pr.get("head", {}).get("ref", ""),
             commit_sha=pr.get("head", {}).get("sha", ""),
             author=pr.get("user", {}).get("login", ""),
@@ -104,7 +128,7 @@ def parse_github(payload: dict, event_header: str) -> WebhookEvent:
     return WebhookEvent(
         platform="github",
         event_type=event_header,
-        repo_url=payload.get("repository", {}).get("clone_url", ""),
+        repo_url=_normalize_url(payload.get("repository", {}).get("clone_url", "")),
         branch="",
         commit_sha="",
         author="",
@@ -119,7 +143,7 @@ def parse_gitea(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="gitea",
             event_type="push",
-            repo_url=payload["repository"]["clone_url"],
+            repo_url=_normalize_url(payload["repository"]["clone_url"]),
             branch=payload.get("ref", "").replace("refs/heads/", ""),
             commit_sha=payload.get("after", ""),
             before_sha=payload.get("before", ""),
@@ -132,7 +156,7 @@ def parse_gitea(payload: dict, event_header: str) -> WebhookEvent:
         return WebhookEvent(
             platform="gitea",
             event_type=f"mr_{payload.get('action', 'open')}",
-            repo_url=payload["repository"]["clone_url"],
+            repo_url=_normalize_url(payload["repository"]["clone_url"]),
             branch=pr.get("head", {}).get("ref", ""),
             commit_sha=pr.get("head", {}).get("sha", ""),
             author=pr.get("user", {}).get("login", ""),
@@ -147,7 +171,7 @@ def parse_gitea(payload: dict, event_header: str) -> WebhookEvent:
     return WebhookEvent(
         platform="gitea",
         event_type=event_header,
-        repo_url=payload.get("repository", {}).get("clone_url", ""),
+        repo_url=_normalize_url(payload.get("repository", {}).get("clone_url", "")),
         branch="",
         commit_sha="",
         author="",

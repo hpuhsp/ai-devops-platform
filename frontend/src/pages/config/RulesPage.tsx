@@ -57,7 +57,7 @@ export default function RulesPage() {
     listRules(repoId).then(setRules).finally(() => setLoading(false))
   }, [repoId])
 
-  const reload = () => repoId && listRules(repoId).then(setRules)
+  const reload = () => { if (repoId) listRules(repoId).then(setRules) }
 
   const handleTemplate = async (key: string) => {
     if (!repoId) return

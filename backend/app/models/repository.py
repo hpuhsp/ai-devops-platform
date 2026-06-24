@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -6,6 +6,10 @@ from app.core.database import Base
 
 class Repository(Base):
     __tablename__ = "repositories"
+    __table_args__ = (
+        # Hot path: webhook handler filters repos by (platform, enabled).
+        Index("ix_repositories_platform_enabled", "platform", "enabled"),
+    )
 
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)

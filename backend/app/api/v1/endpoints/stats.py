@@ -109,7 +109,7 @@ async def get_trends(days: int = 7, db: AsyncSession = Depends(get_db)):
                 COUNT(*)                                       AS count,
                 SUM(prompt_tokens + completion_tokens)         AS tokens
             FROM ai_tasks
-            WHERE created_at >= NOW() - INTERVAL ':days days'
+            WHERE created_at >= NOW() - make_interval(days => :days)
             GROUP BY day, task_type
             ORDER BY day
         """).bindparams(days=days)

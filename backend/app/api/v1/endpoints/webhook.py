@@ -92,12 +92,29 @@ async def receive_webhook(
     if event.event_type not in ("push", "mr_open", "mr_reopened", "mr_update"):
         return {"status": "ignored", "reason": f"event_type '{event.event_type}' not handled"}
 
+    task_type = "push_event" if event.event_type == "push" else "mr_review"
+
+    # Idempotency: a webhook may be re-delivered or retried. Skip if we already have
+    # a non-failed task for the same repo + commit + type (re-runs only on failure).
+    all_zeros = "0" * 40
+    if event.commit_sha and event.commit_sha != all_zeros:
+        existing = (await db.execute(
+            select(AITask).where(
+                AITask.repo_id == repo.id,
+                AITask.task_type == task_type,
+                AITask.input_data["commit_sha"].astext == event.commit_sha,
+                AITask.status != "failed",
+            )
+        )).scalars().first()
+        if existing:
+            return {"status": "ignored", "reason": "duplicate delivery", "task_id": existing.task_id}
+
     # Create task record
     task_id = str(uuid.uuid4())
     ai_task = AITask(
         task_id=task_id,
         repo_id=repo.id,
-        task_type="push_event" if event.event_type == "push" else "mr_review",
+        task_type=task_type,
         status="pending",
         trigger_event={
             "platform": platform,

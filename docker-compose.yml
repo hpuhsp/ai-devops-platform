@@ -32,7 +32,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8090:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://devops:devops123@postgres:5432/ai_devops
       DATABASE_SYNC_URL: postgresql://devops:devops123@postgres:5432/ai_devops
@@ -40,6 +40,10 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       DEBUG: "true"
+      # Crypto secrets — override in a root .env for any non-local use.
+      # Defaults here are dev-only; non-DEBUG boots refuse the repo placeholders.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-local-encryption-key-change-me}
+      SECRET_KEY: ${SECRET_KEY:-dev-local-secret-key-change-me}
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,6 +66,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # Worker decrypts Git tokens / API keys — must share the API's key.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-local-encryption-key-change-me}
+      SECRET_KEY: ${SECRET_KEY:-dev-local-secret-key-change-me}
     depends_on:
       - api
     volumes:
@@ -89,13 +96,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
-    environment:
-      VITE_API_BASE_URL: http://localhost:8000
+      - "3010:3000"
     depends_on:
       - api
-    volumes:
-      - ./frontend/src:/app/src
 
   # ── Gitea (local Git platform for testing) ──────────────────────────
   gitea:
