@@ -26,12 +26,52 @@ export default function MainLayout() {
   const navigate = useNavigate()
   const location = useLocation()
 
+  const getBreadcrumb = () => {
+    if (location.pathname === '/dashboard') return '动态驾驶舱'
+    if (location.pathname.startsWith('/config')) return '配置管理'
+    return '任务日志'
+  }
+
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider width={220} theme="dark">
-        <div style={{ padding: '16px 24px', borderBottom: '1px solid #333' }}>
-          <Typography.Text strong style={{ color: '#fff', fontSize: 16 }}>
-            🤖 AI DevOps 平台
+      <Sider
+        width={224}
+        style={{
+          background: 'linear-gradient(180deg, #0f1222 0%, #161a2e 100%)',
+          borderRight: '1px solid rgba(255,255,255,0.06)',
+          boxShadow: '2px 0 24px rgba(0,0,0,0.15)',
+        }}
+      >
+        <div
+          style={{
+            padding: '20px 24px 16px',
+            borderBottom: '1px solid rgba(255,255,255,0.08)',
+          }}
+        >
+          <Typography.Text
+            strong
+            style={{
+              color: '#fff',
+              fontSize: 17,
+              letterSpacing: '-0.3px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span style={{ fontSize: 20 }}>⚡</span>
+            AI DevOps
+          </Typography.Text>
+          <Typography.Text
+            style={{
+              color: 'rgba(255,255,255,0.35)',
+              fontSize: 11,
+              display: 'block',
+              marginTop: 2,
+              letterSpacing: '0.5px',
+            }}
+          >
+            效能平台
           </Typography.Text>
         </div>
         <Menu
@@ -41,17 +81,41 @@ export default function MainLayout() {
           defaultOpenKeys={['config']}
           items={menuItems}
           onClick={({ key }) => navigate(key)}
-          style={{ marginTop: 8 }}
+          style={{
+            background: 'transparent',
+            marginTop: 8,
+            padding: '0 10px',
+          }}
         />
       </Sider>
       <Layout>
-        <Header style={{ background: '#fff', padding: '0 24px', borderBottom: '1px solid #f0f0f0' }}>
-          <Typography.Text type="secondary">
-            {location.pathname === '/dashboard' ? '动态驾驶舱' :
-             location.pathname.startsWith('/config') ? '配置管理' : '任务日志'}
+        <Header
+          style={{
+            background: '#fff',
+            padding: '0 28px',
+            borderBottom: '1px solid rgba(0,0,0,0.06)',
+            display: 'flex',
+            alignItems: 'center',
+            height: 52,
+            lineHeight: '52px',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.03)',
+            position: 'sticky',
+            top: 0,
+            zIndex: 10,
+          }}
+        >
+          <Typography.Text
+            style={{ fontSize: 13, color: '#888', fontWeight: 500, letterSpacing: '0.3px' }}
+          >
+            {getBreadcrumb()}
           </Typography.Text>
         </Header>
-        <Content style={{ margin: '24px', background: '#f5f5f5', minHeight: 'calc(100vh - 112px)' }}>
+        <Content
+          style={{
+            margin: '20px',
+            minHeight: 'calc(100vh - 92px)',
+          }}
+        >
           <Outlet />
         </Content>
       </Layout>

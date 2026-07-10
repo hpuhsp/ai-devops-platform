@@ -49,7 +49,6 @@ export default function DashboardPage() {
       .finally(() => setLoading(false))
   }, [])
 
-  // Auto-refresh every 8s if any event is running
   useEffect(() => {
     const hasRunning = events.items.some((e: any) => ACTIVE_STATUS.includes(e.status))
     if (!hasRunning) return
@@ -77,9 +76,7 @@ export default function DashboardPage() {
       ),
     },
     {
-      title: '作者',
-      dataIndex: 'author',
-      width: 90,
+      title: '作者', dataIndex: 'author', width: 90,
       render: (v: string) => <Text style={{ fontSize: 12 }}>{v || '—'}</Text>,
     },
     {
@@ -94,20 +91,15 @@ export default function DashboardPage() {
       ),
     },
     {
-      title: '耗时',
-      dataIndex: 'duration_ms',
-      width: 70,
+      title: '耗时', dataIndex: 'duration_ms', width: 70,
       render: (v: number) => v ? `${(v / 1000).toFixed(1)}s` : '—',
     },
     {
-      title: '时间',
-      dataIndex: 'created_at',
-      width: 110,
+      title: '时间', dataIndex: 'created_at', width: 110,
       render: (v: string) => dayjs(v).format('MM-DD HH:mm'),
     },
     {
-      title: '',
-      width: 60,
+      title: '', width: 60,
       render: (_: any, r: any) => (
         <Button size="small" type="link" onClick={() => navigate(`/tasks/${r.task_id}`)}>
           详情
@@ -118,9 +110,10 @@ export default function DashboardPage() {
 
   return (
     <div>
-      {/* ── Header ── */}
-      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24, gap: 12 }}>
-        <Title level={4} style={{ margin: 0 }}>智能 DevOps 驾驶舱</Title>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20, gap: 12 }}>
+        <Title level={4} style={{ margin: 0, fontWeight: 600, letterSpacing: '-0.3px' }}>
+          智能 DevOps 驾驶舱
+        </Title>
         <Button
           size="small"
           icon={<ReloadOutlined />}
@@ -133,52 +126,52 @@ export default function DashboardPage() {
       {/* ── Phase 1 Three Dimensions ── */}
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
-          <Card bodyStyle={{ padding: '16px 20px' }}>
+          <Card className="stat-card stat-card-review" bodyStyle={{ padding: '18px 20px' }}>
             <Statistic
-              title={<span><CheckCircleOutlined style={{ color: '#1677ff', marginRight: 6 }} />代码审查</span>}
+              title={<span><CheckCircleOutlined style={{ color: '#3b5ccc', marginRight: 6 }} />代码审查</span>}
               value={cr.total ?? 0}
               suffix={<Text type="secondary" style={{ fontSize: 13 }}>次</Text>}
             />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 12 }}>
-              <span>拦截 <strong style={{ color: '#ff4d4f' }}>{cr.blocked ?? 0}</strong>次</span>
+            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 14 }}>
+              <span>拦截 <strong style={{ color: '#cf222e' }}>{cr.blocked ?? 0}</strong>次</span>
               <span>拦截率 <strong>{cr.block_rate ?? 0}%</strong></span>
-              <span>均分 <strong style={{ color: '#52c41a' }}>{cr.avg_score ?? '—'}</strong></span>
+              <span>均分 <strong style={{ color: '#2da44e' }}>{cr.avg_score ?? '—'}</strong></span>
             </div>
           </Card>
         </Col>
 
         <Col xs={24} sm={12} lg={6}>
-          <Card bodyStyle={{ padding: '16px 20px' }}>
+          <Card className="stat-card stat-card-test" bodyStyle={{ padding: '18px 20px' }}>
             <Statistic
-              title={<span><ExperimentOutlined style={{ color: '#52c41a', marginRight: 6 }} />单元测试</span>}
+              title={<span><ExperimentOutlined style={{ color: '#2da44e', marginRight: 6 }} />单元测试</span>}
               value={tg.total ?? 0}
               suffix={<Text type="secondary" style={{ fontSize: 13 }}>次</Text>}
             />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 12 }}>
-              <span>通过 <strong style={{ color: '#52c41a' }}>{tg.passed ?? 0}</strong>次</span>
+            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 14 }}>
+              <span>通过 <strong style={{ color: '#2da44e' }}>{tg.passed ?? 0}</strong>次</span>
               <span>通过率 <strong>{tg.pass_rate ?? 0}%</strong></span>
             </div>
           </Card>
         </Col>
 
         <Col xs={24} sm={12} lg={6}>
-          <Card bodyStyle={{ padding: '16px 20px' }}>
+          <Card className="stat-card stat-card-merge" bodyStyle={{ padding: '18px 20px' }}>
             <Statistic
-              title={<span><MergeCellsOutlined style={{ color: '#722ed1', marginRight: 6 }} />智能合并</span>}
+              title={<span><MergeCellsOutlined style={{ color: '#7c3aed', marginRight: 6 }} />智能合并</span>}
               value={am.total ?? 0}
               suffix={<Text type="secondary" style={{ fontSize: 13 }}>次</Text>}
             />
-            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 12 }}>
-              <span>成功 <strong style={{ color: '#52c41a' }}>{am.success ?? 0}</strong>次</span>
+            <div style={{ marginTop: 8, fontSize: 12, color: '#888', display: 'flex', gap: 14 }}>
+              <span>成功 <strong style={{ color: '#2da44e' }}>{am.success ?? 0}</strong>次</span>
               <span>成功率 <strong>{am.success_rate ?? 0}%</strong></span>
             </div>
           </Card>
         </Col>
 
         <Col xs={24} sm={12} lg={6}>
-          <Card bodyStyle={{ padding: '16px 20px' }}>
+          <Card className="stat-card stat-card-token" bodyStyle={{ padding: '18px 20px' }}>
             <Statistic
-              title={<span><ThunderboltOutlined style={{ color: '#fa8c16', marginRight: 6 }} />Token 消耗</span>}
+              title={<span><ThunderboltOutlined style={{ color: '#d97706', marginRight: 6 }} />Token 消耗</span>}
               value={overview?.total_tokens_used ?? 0}
             />
             <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
@@ -188,8 +181,10 @@ export default function DashboardPage() {
         </Col>
       </Row>
 
-      {/* ── Recent Push Events with Pipeline Chain ── */}
-      <Title level={5} style={{ marginTop: 28, marginBottom: 12 }}>近期推送事件 · 流水线进度</Title>
+      {/* ── Recent Push Events ── */}
+      <Title level={5} style={{ marginTop: 24, marginBottom: 12, fontWeight: 600 }}>
+        近期推送事件
+      </Title>
       <Card bodyStyle={{ padding: 0 }}>
         <Table
           dataSource={events.items}
@@ -208,16 +203,23 @@ export default function DashboardPage() {
         />
       </Card>
 
-      {/* ── Phase 2 Reserved Panels ── */}
-      <Title level={5} style={{ marginTop: 28, marginBottom: 12 }}>
-        二期预留面板
+      {/* ── Phase 2 Reserved ── */}
+      <Title level={5} style={{ marginTop: 24, marginBottom: 12, fontWeight: 600 }}>
+        二期预留
         <Tag color="orange" style={{ marginLeft: 10, fontSize: 11 }}>Coming in Phase 2</Tag>
       </Title>
       <Row gutter={[16, 16]}>
-        {['🏗️ Jenkins 构建统计', '🚀 自动发布记录', '📊 构建成功率趋势'].map(title => (
+        {['Jenkins 构建统计', '自动发布记录', '构建成功率趋势'].map(title => (
           <Col key={title} xs={24} sm={12} lg={8}>
-            <Card title={title} extra={<Tag color="default">待接入</Tag>} style={{ opacity: 0.55 }}>
-              <div style={{ height: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#bbb', fontSize: 13 }}>
+            <Card
+              title={title}
+              extra={<Tag color="default">待接入</Tag>}
+              style={{ opacity: 0.55, filter: 'grayscale(30%)' }}
+            >
+              <div style={{
+                height: 60, display: 'flex', alignItems: 'center',
+                justifyContent: 'center', color: '#bbb', fontSize: 13,
+              }}>
                 数据接入后自动展示
               </div>
             </Card>
