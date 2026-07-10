@@ -45,10 +45,7 @@ class PipelineContext:
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
-    # Per-stage model routing (Sprint A — legacy)
-    stage_router: Any = None
-
-    # Per-stage agent resolution (Agent Management Module — new)
+    # Per-stage agent resolution (always available — system agents serve as defaults)
     agent_resolver: Any = None
 
     # Status callback for fine-grained task status updates (Sprint D)
@@ -78,15 +75,6 @@ class TestManagerAgent:
         "generator": "generator",
         "validate_repair": "validate_repair",
         "quality_scorer": "quality_scorer",
-    }
-
-    # Pipeline stage_name → legacy StageRouter stage category
-    _STAGE_TO_LEGACY = {
-        "code_review": "analysis",
-        "change_intelligence": "analysis",
-        "generator": "generation",
-        "validate_repair": "repair",
-        "quality_scorer": "scoring",
     }
 
     _STAGE_OUTPUT_KEYS = {
@@ -152,8 +140,6 @@ class TestManagerAgent:
         # Record per-stage model usage
         if ctx.agent_resolver:
             ctx.output_data["model_usage"] = ctx.agent_resolver.get_model_usage()
-        elif ctx.stage_router:
-            ctx.output_data["model_usage"] = ctx.stage_router.get_model_usage()
 
         return {
             "output_data": ctx.output_data,
@@ -229,21 +215,12 @@ class TestManagerAgent:
         )
 
     def _engine_for(self, ctx: PipelineContext, stage_name: str):
-        """Resolve engine for a pipeline stage, with safe fallback to ctx.engine.
-
-        Priority: agent_resolver (new, only if stage has a binding) > stage_router (legacy) > repo default engine.
-        """
+        """Resolve engine for a pipeline stage via AgentResolver."""
         if ctx.agent_resolver:
             stage_type = self._STAGE_TO_TYPE.get(stage_name)
-            if stage_type and ctx.agent_resolver.get_binding(stage_type):
-                engine = ctx.agent_resolver.get_engine(stage_type)
-                if engine:
-                    return engine
-        if ctx.stage_router:
-            legacy_stage = self._STAGE_TO_LEGACY.get(stage_name, stage_name)
-            engine = ctx.stage_router.get_engine(legacy_stage)
-            if engine:
-                return engine
+            if stage_type:
+                return ctx.agent_resolver.get_engine(stage_type)
+        # Should never reach here — agent_resolver is always built
         return ctx.engine
 
     def _skill_config_for(self, ctx: PipelineContext, stage_name: str) -> dict:

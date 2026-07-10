@@ -192,23 +192,32 @@ class TestAgentResolver:
 class TestBuildAgentResolverSync:
     """Tests for the synchronous factory function."""
 
-    def test_no_agent_bindings_returns_none(self):
+    def test_no_agent_bindings_returns_resolver(self):
         repo = MagicMock()
         repo.agent_bindings = None
         fallback = _make_engine("gpt-4o-mini")
         session = MagicMock()
+        # No system agents in DB
+        q = MagicMock()
+        session.query.return_value = q
+        q.filter.return_value.all.return_value = []
 
         result = build_agent_resolver_sync(repo, fallback, session)
-        assert result is None
+        assert isinstance(result, AgentResolver)
+        assert result.get_engine("code_review") is fallback
 
-    def test_empty_agent_bindings_returns_none(self):
+    def test_empty_agent_bindings_returns_resolver(self):
         repo = MagicMock()
         repo.agent_bindings = {}
         fallback = _make_engine("gpt-4o-mini")
         session = MagicMock()
+        q = MagicMock()
+        session.query.return_value = q
+        q.filter.return_value.all.return_value = []
 
         result = build_agent_resolver_sync(repo, fallback, session)
-        assert result is None
+        assert isinstance(result, AgentResolver)
+        assert result.get_engine("code_review") is fallback
 
     def test_with_bindings_loads_agents_and_engines(self):
         repo = MagicMock()
@@ -283,26 +292,25 @@ class TestBuildAgentResolverSync:
         repo.agent_bindings = {"code_review": 1}
         fallback = _make_engine("gpt-4o-mini")
 
-        mock_agent = MagicMock()
-        mock_agent.id = 1
-        mock_agent.enabled = False
-
         session = MagicMock()
         q = MagicMock()
-        q.filter.return_value.all.return_value = []
         session.query.return_value = q
+        q.filter.return_value.all.return_value = []
 
         result = build_agent_resolver_sync(repo, fallback, session)
-        assert result is None
+        assert isinstance(result, AgentResolver)
 
-    def test_missing_getattr_returns_none(self):
-        """Repo without agent_bindings attribute should return None."""
-        repo = MagicMock(spec=[])  # No attributes
+    def test_missing_getattr_returns_resolver(self):
+        repo = MagicMock(spec=[])
         fallback = _make_engine("gpt-4o-mini")
         session = MagicMock()
 
+        q = MagicMock()
+        session.query.return_value = q
+        q.filter.return_value.all.return_value = []
+
         result = build_agent_resolver_sync(repo, fallback, session)
-        assert result is None
+        assert isinstance(result, AgentResolver)
 
 
 # ── Skill Metadata Tests ────────────────────────────────────────────────────
@@ -380,11 +388,9 @@ class TestPipelineAgentIntegration:
         assert ctx.agent_resolver is resolver
 
     def test_engine_for_with_agent_resolver(self):
-        """Agent resolver takes priority over stage_router."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
 
         agent_engine = _make_engine("claude-3-sonnet")
-        legacy_engine = _make_engine("deepseek-chat")
         fallback = _make_engine("gpt-4o-mini")
 
         resolver = AgentResolver(
@@ -401,50 +407,39 @@ class TestPipelineAgentIntegration:
         ctx = PipelineContext(
             engine=fallback,
             agent_resolver=resolver,
-            stage_router=MagicMock(),
         )
         manager = TestManagerAgent()
 
-        # Agent resolver should take priority
         result = manager._engine_for(ctx, "code_review")
         assert result is agent_engine
 
-    def test_engine_for_falls_to_stage_router_when_no_agent_binding(self):
-        """When agent_resolver exists but stage has no binding, fall through to stage_router."""
+    def test_engine_for_falls_to_resolver_fallback(self):
+        """When agent_resolver has no binding for a stage, falls back to resolver's fallback."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-        from app.services.ai.stage_router import StageRouter, STAGE_ANALYSIS
 
-        legacy_engine = _make_engine("deepseek-chat")
         fallback = _make_engine("gpt-4o-mini")
 
         resolver = AgentResolver(
-            _bindings={},  # No bindings for any stage
-            _fallback_engine=fallback,
-        )
-
-        router = StageRouter(
-            _engines_by_id={1: legacy_engine},
-            _stage_models={STAGE_ANALYSIS: 1},
+            _bindings={},
             _fallback_engine=fallback,
         )
 
         ctx = PipelineContext(
             engine=fallback,
             agent_resolver=resolver,
-            stage_router=router,
         )
         manager = TestManagerAgent()
 
-        # No agent binding → fall through to stage_router → "code_review" maps to "analysis"
         result = manager._engine_for(ctx, "code_review")
-        assert result is legacy_engine
+        assert result is fallback
 
     def test_engine_for_falls_to_default_engine(self):
-        """No agent_resolver, no stage_router → use default engine."""
+        """agent_resolver always available, get_engine handles fallback."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
 
         fallback = _make_engine("gpt-4o-mini")
-        ctx = PipelineContext(engine=fallback)
+        resolver = AgentResolver(_bindings={}, _fallback_engine=fallback)
+        ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
         assert manager._engine_for(ctx, "code_review") is fallback
@@ -525,19 +520,6 @@ class TestPipelineAgentIntegration:
             "quality_scorer": "quality_scorer",
         }
         assert TestManagerAgent._STAGE_TO_TYPE == expected
-
-    def test_stage_to_legacy_mapping(self):
-        """Verify the _STAGE_TO_LEGACY mapping for backward compat."""
-        from app.services.agents.test_manager import TestManagerAgent
-
-        expected = {
-            "code_review": "analysis",
-            "change_intelligence": "analysis",
-            "generator": "generation",
-            "validate_repair": "repair",
-            "quality_scorer": "scoring",
-        }
-        assert TestManagerAgent._STAGE_TO_LEGACY == expected
 
     def test_get_model_config_for_with_agent(self):
         """_model_config_for returns agent's model_config."""

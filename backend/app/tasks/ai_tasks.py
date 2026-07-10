@@ -274,15 +274,17 @@ def process_push_event(self, repo_id: int, event_data: dict):
         )
         db.commit()
 
-        # Load repo + model + resolve pipeline stages via RuleEngine
+        # Load repo + platform default model + resolve pipeline stages via RuleEngine
         repo = db.execute(select(Repository).where(Repository.id == repo_id)).scalar_one_or_none()
         if not repo:
             _mark_failed(db, task_id, f"Repository {repo_id} not found")
             return
 
-        model = None
-        if repo.ai_model_id:
-            model = db.execute(select(AIModel).where(AIModel.id == repo.ai_model_id)).scalar_one_or_none()
+        # Platform default model — used as ultimate fallback when no agent binding
+        # specifies a model. No longer sourced from repo.ai_model_id.
+        platform_model = db.execute(
+            select(AIModel).where(AIModel.is_default == True)
+        ).scalar_one_or_none()
 
         from app.services.rules.engine import get_stages_sync
         branch = event_data.get("branch", "")
@@ -307,7 +309,7 @@ def process_push_event(self, repo_id: int, event_data: dict):
     try:
         # ── Async block: git + AI inference only, no DB ────────────────
         output = _run_async(_ai_pipeline(
-            repo, model, event_data, task_id, notify_cfg, enabled_stages,
+            repo, platform_model, event_data, task_id, notify_cfg, enabled_stages,
             status_callback=_async_status_callback,
         ))
         # ──────────────────────────────────────────────────────────────
@@ -346,14 +348,15 @@ def process_push_event(self, repo_id: int, event_data: dict):
         raise self.retry(exc=exc, countdown=30)
 
 
-async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None, status_callback=None) -> dict:
+async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None, status_callback=None) -> dict:
     """Pure async: git diff + AI pipeline orchestration. No DB access."""
     from app.services.ai.engine import build_engine_from_db_model, AIEngine
     from app.services.skills.base import SkillContext
     from app.services.git.agent import GitAgent
     from app.core.security import decrypt
 
-    engine = build_engine_from_db_model(model) if model else AIEngine()
+    # Platform default engine — ultimate fallback when no agent binding specifies a model
+    platform_engine = build_engine_from_db_model(platform_model) if platform_model else AIEngine()
 
     git_token = decrypt(repo.git_token_encrypted) if repo.git_token_encrypted else None
     git_agent = GitAgent(repo.repo_url, git_token)
@@ -384,26 +387,17 @@ async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: 
 
     # Delegate to TestManagerAgent
     from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-    from app.services.ai.stage_router import build_stage_router_sync
     from app.services.ai.agent_resolver import build_agent_resolver_sync
 
-    # Build agent resolver from repo.agent_bindings (new — Agent Management Module)
-    agent_resolver = None
-    agent_bindings = getattr(repo, "agent_bindings", None) or {}
-    if agent_bindings:
-        with SyncSession() as resolver_db:
-            agent_resolver = build_agent_resolver_sync(repo, engine, resolver_db)
+    # Always build AgentResolver — system built-in agents serve as defaults
+    with SyncSession() as resolver_db:
+        agent_resolver = build_agent_resolver_sync(repo, platform_engine, resolver_db)
 
-    # Build per-stage model router from repo config (legacy — Sprint A)
-    stage_router = None
     skills_config = repo.skills_config or {}
-    if skills_config.get("stage_models"):
-        with SyncSession() as router_db:
-            stage_router = build_stage_router_sync(repo, engine, router_db)
 
     pipeline_ctx = PipelineContext(
         repo=repo,
-        engine=engine,
+        engine=platform_engine,
         git_agent=git_agent,
         git_token=git_token,
         skill_context=context,
@@ -412,7 +406,6 @@ async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: 
         enabled_stages=set(enabled_stages or ["code_review"]),
         skills_config=skills_config,
         notify_cfg=notify_cfg,
-        stage_router=stage_router,
         agent_resolver=agent_resolver,
         status_callback=status_callback,
     )

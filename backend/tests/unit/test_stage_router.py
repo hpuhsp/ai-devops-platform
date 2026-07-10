@@ -11,6 +11,7 @@ from app.services.ai.stage_router import (
     STAGE_SCORING,
     ALL_STAGES,
 )
+from app.services.ai.agent_resolver import AgentResolver, AgentBinding
 from app.services.ai.engine import AIEngine, ModelConfig
 
 
@@ -222,53 +223,66 @@ class TestBuildStageRouterSync:
 
 
 class TestPipelineContextIntegration:
-    """Test that PipelineContext correctly uses StageRouter."""
+    """Test that PipelineContext correctly uses AgentResolver (primary resolver)."""
 
-    def test_pipeline_context_has_stage_router_field(self):
+    def test_pipeline_context_has_agent_resolver_field(self):
         from app.services.agents.test_manager import PipelineContext
 
         ctx = PipelineContext()
-        assert ctx.stage_router is None
+        assert ctx.agent_resolver is None
 
-        router = StageRouter(_fallback_engine=_make_engine("test"))
-        ctx.stage_router = router
-        assert ctx.stage_router is router
+        resolver = AgentResolver(_bindings={}, _fallback_engine=_make_engine("test"))
+        ctx.agent_resolver = resolver
+        assert ctx.agent_resolver is resolver
 
-    def test_engine_for_with_partial_router(self):
-        """Router with only analysis+generation configured; repair+scoring fall back."""
+    def test_engine_for_with_partial_resolver(self):
+        """Resolver with only analysis+generation configured; repair+scoring fall back."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
 
         engine_analysis = _make_engine("claude-3-sonnet")
         engine_gen = _make_engine("deepseek-chat")
         fallback = _make_engine("gpt-4o-mini")
 
-        router = StageRouter(
+        from app.services.ai.agent_resolver import AgentBinding
+        resolver = AgentResolver(
+            _bindings={
+                "code_review": AgentBinding(
+                    agent_id=1, agent_name="CR", stage_type="code_review",
+                    skill_name="code_review", model_id=1,
+                ),
+                "generator": AgentBinding(
+                    agent_id=2, agent_name="Gen", stage_type="generator",
+                    skill_name="test_generation", model_id=2,
+                ),
+            },
             _engines_by_id={1: engine_analysis, 2: engine_gen},
-            _stage_models={STAGE_ANALYSIS: 1, STAGE_GENERATION: 2},
             _fallback_engine=fallback,
         )
 
-        ctx = PipelineContext(engine=fallback, stage_router=router)
+        ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        assert manager._engine_for(ctx, STAGE_ANALYSIS) is engine_analysis
-        assert manager._engine_for(ctx, STAGE_GENERATION) is engine_gen
-        assert manager._engine_for(ctx, STAGE_REPAIR) is fallback
-        assert manager._engine_for(ctx, STAGE_SCORING) is fallback
+        assert manager._engine_for(ctx, "code_review") is engine_analysis
+        assert manager._engine_for(ctx, "generator") is engine_gen
+        assert manager._engine_for(ctx, "validate_repair") is fallback
+        assert manager._engine_for(ctx, "quality_scorer") is fallback
 
-    def test_engine_for_without_router(self):
+    def test_engine_for_without_bindings(self):
+        """No bindings in resolver → all stages fall back."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
 
         fallback = _make_engine("gpt-4o-mini")
-        ctx = PipelineContext(engine=fallback, stage_router=None)
+        resolver = AgentResolver(_bindings={}, _fallback_engine=fallback)
+        ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        for stage in ALL_STAGES:
+        for stage in ["code_review", "generator", "validate_repair", "quality_scorer"]:
             assert manager._engine_for(ctx, stage) is fallback
 
-    def test_engine_for_full_router(self):
-        """All 4 stages configured to different models."""
+    def test_engine_for_full_resolver(self):
+        """All stages configured to different models via AgentResolver."""
         from app.services.agents.test_manager import TestManagerAgent, PipelineContext
+        from app.services.ai.agent_resolver import AgentBinding
 
         e1 = _make_engine("claude-3-sonnet")
         e2 = _make_engine("deepseek-chat")
@@ -276,21 +290,33 @@ class TestPipelineContextIntegration:
         e4 = _make_engine("gpt-4o")
         fallback = _make_engine("gpt-4o-mini")
 
-        router = StageRouter(
-            _engines_by_id={1: e1, 2: e2, 3: e3, 4: e4},
-            _stage_models={
-                STAGE_ANALYSIS: 1,
-                STAGE_GENERATION: 2,
-                STAGE_REPAIR: 3,
-                STAGE_SCORING: 4,
+        resolver = AgentResolver(
+            _bindings={
+                "code_review": AgentBinding(
+                    agent_id=1, agent_name="CR", stage_type="code_review",
+                    skill_name="code_review", model_id=1,
+                ),
+                "generator": AgentBinding(
+                    agent_id=2, agent_name="Gen", stage_type="generator",
+                    skill_name="test_generation", model_id=2,
+                ),
+                "validate_repair": AgentBinding(
+                    agent_id=3, agent_name="Repair", stage_type="validate_repair",
+                    skill_name="validate_repair", model_id=3,
+                ),
+                "quality_scorer": AgentBinding(
+                    agent_id=4, agent_name="Scorer", stage_type="quality_scorer",
+                    skill_name="quality_scorer", model_id=4,
+                ),
             },
+            _engines_by_id={1: e1, 2: e2, 3: e3, 4: e4},
             _fallback_engine=fallback,
         )
 
-        ctx = PipelineContext(engine=fallback, stage_router=router)
+        ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        assert manager._engine_for(ctx, STAGE_ANALYSIS) is e1
-        assert manager._engine_for(ctx, STAGE_GENERATION) is e2
-        assert manager._engine_for(ctx, STAGE_REPAIR) is e3
-        assert manager._engine_for(ctx, STAGE_SCORING) is e4
+        assert manager._engine_for(ctx, "code_review") is e1
+        assert manager._engine_for(ctx, "generator") is e2
+        assert manager._engine_for(ctx, "validate_repair") is e3
+        assert manager._engine_for(ctx, "quality_scorer") is e4

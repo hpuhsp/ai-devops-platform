@@ -1,3 +1,3 @@
-from app.services.ai.stage_router import StageRouter, build_stage_router_sync, ALL_STAGES
+from app.services.ai.agent_resolver import AgentResolver, build_agent_resolver_sync, AgentBinding
 
-__all__ = ["StageRouter", "build_stage_router_sync", "ALL_STAGES"]
+__all__ = ["AgentResolver", "build_agent_resolver_sync", "AgentBinding"]

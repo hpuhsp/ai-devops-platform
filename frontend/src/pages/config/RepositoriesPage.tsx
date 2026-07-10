@@ -71,7 +71,6 @@ export default function RepositoriesPage() {
       },
       agent_bindings: agentBindings,
     }
-    delete (payload as any).stage_models
     setLoading(true)
     try {
       if (editing) { await updateRepo(editing.id, payload); message.success('更新成功') }
@@ -94,13 +93,6 @@ export default function RepositoriesPage() {
     { title: '名称', dataIndex: 'name' },
     { title: '平台', dataIndex: 'platform', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { title: '仓库地址', dataIndex: 'repo_url', ellipsis: true },
-    {
-      title: 'AI 模型',
-      render: (_: any, r: any) => {
-        const defaultModel = models.find(m => m.id === r.ai_model_id)?.name || '默认'
-        return <Text>{defaultModel}</Text>
-      },
-    },
     {
       title: 'Agent 绑定',
       render: (_: any, r: any) => {
@@ -200,9 +192,6 @@ export default function RepositoriesPage() {
           </Form.Item>
           <Form.Item name="webhook_secret" label="Webhook Secret">
             <Input.Password />
-          </Form.Item>
-          <Form.Item name="ai_model_id" label="默认 AI 模型 (留空使用系统默认)">
-            <Select allowClear options={models.map(m => ({ value: m.id, label: m.name }))} />
           </Form.Item>
 
           <Divider style={{ margin: '12px 0' }}>Agent 绑定</Divider>

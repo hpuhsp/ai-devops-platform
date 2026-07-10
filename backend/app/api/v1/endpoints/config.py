@@ -299,7 +299,6 @@ class RepoCreate(BaseModel):
     webhook_secret: Optional[str] = None
     git_token: Optional[str] = None
     branch_rules: dict = {"feature/*": "develop", "develop": "main"}
-    ai_model_id: Optional[int] = None
     skills_config: dict = {}
     agent_bindings: dict = {}
     enabled: bool = True
@@ -316,7 +315,6 @@ async def list_repos(db: AsyncSession = Depends(get_db)):
             "platform": r.platform,
             "repo_url": r.repo_url,
             "branch_rules": r.branch_rules,
-            "ai_model_id": r.ai_model_id,
             "skills_config": r.skills_config,
             "agent_bindings": getattr(r, "agent_bindings", None) or {},
             "enabled": r.enabled,
@@ -334,7 +332,6 @@ async def create_repo(body: RepoCreate, db: AsyncSession = Depends(get_db)):
         webhook_secret=body.webhook_secret,
         git_token_encrypted=encrypt(body.git_token) if body.git_token else None,
         branch_rules=body.branch_rules,
-        ai_model_id=body.ai_model_id,
         skills_config=body.skills_config,
         agent_bindings=body.agent_bindings,
         enabled=body.enabled,
@@ -359,7 +356,6 @@ async def update_repo(repo_id: int, body: RepoCreate, db: AsyncSession = Depends
     if body.git_token:
         repo.git_token_encrypted = encrypt(body.git_token)
     repo.branch_rules = body.branch_rules
-    repo.ai_model_id = body.ai_model_id
     repo.skills_config = body.skills_config
     repo.agent_bindings = body.agent_bindings
     repo.enabled = body.enabled

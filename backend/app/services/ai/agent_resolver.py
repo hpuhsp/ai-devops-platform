@@ -1,10 +1,13 @@
 """
-Agent-based stage resolution. Replaces StageRouter for repos that use
-agent_bindings. Each Agent encapsulates a bound model plus skill/model/policy
-config, giving per-stage control that is richer than the legacy stage_models
-approach.
+Agent-based stage resolution. Single entry point for all per-stage model/agent
+resolution. Replaces both the legacy StageRouter and repository default models.
 
-Three-layer model: Model (capability) → Agent (behavior) → Repository (binding)
+Architecture:
+  Model (capability) → Agent (behavior) → Repository (binding, optional)
+
+When a repository has no explicit agent binding for a stage, the system built-in
+agent for that stage_type serves as the default fallback. If the built-in agent
+has no model assigned, the platform default model (or settings fallback) is used.
 """
 from __future__ import annotations
 
@@ -33,10 +36,11 @@ class AgentBinding:
 class AgentResolver:
     """Resolves agent bindings per stage_type.
 
-    Priority: agent_bindings (new) > stage_router (legacy) > repo default engine.
-    When a repo has no agent_bindings, build_agent_resolver_sync returns None
-    and the pipeline falls back to the legacy StageRouter.
+    Always constructed with built-in system agents as base defaults.
+    Repository bindings overlay on top per stage_type.
+    When a binding's model_id is null, falls back to the platform default engine.
     """
+
     _bindings: dict[str, AgentBinding] = field(default_factory=dict)
     _engines_by_id: dict[int, Any] = field(default_factory=dict)
     _fallback_engine: Any = None
@@ -46,7 +50,7 @@ class AgentResolver:
         return self._bindings.get(stage_type)
 
     def get_engine(self, stage_type: str):
-        """Return the AIEngine for a stage, with fallback to repo default."""
+        """Return the AIEngine for a stage, with fallback to platform default."""
         binding = self._bindings.get(stage_type)
         if binding and binding.model_id:
             engine = self._engines_by_id.get(binding.model_id)
@@ -56,7 +60,7 @@ class AgentResolver:
                 "agent_resolver.engine_not_found",
                 stage_type=stage_type,
                 model_id=binding.model_id,
-                fallback="repo_default",
+                fallback="platform_default",
             )
         return self._fallback_engine
 
@@ -109,43 +113,75 @@ class AgentResolver:
         return summaries
 
 
-def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> Optional[AgentResolver]:
-    """Build an AgentResolver from repo.agent_bindings (synchronous, for Celery).
+def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> AgentResolver:
+    """Build an AgentResolver for a repository.
 
-    Returns None if the repo has no agent_bindings, signaling the pipeline
-    to fall back to the legacy StageRouter.
+    Always returns a resolver — never None. The resolver is built in two layers:
+
+    1. Base layer — all is_system=True, enabled=True agents are loaded as the
+       default binding for their stage_type.
+    2. Overlay layer — repo.agent_bindings entries override the base for matching
+       stage_types.
+
+    When a binding's model_id is null (typical for unconfigured system agents),
+    get_engine() returns the platform fallback_engine.
     """
     from app.models.agent import Agent
     from app.models.ai_model import AIModel
     from app.services.ai.engine import build_engine_from_db_model
 
+    bindings: dict[str, AgentBinding] = {}
+
+    # ── Layer 1: System built-in agents as base defaults ──────────────────
+    system_agents = sync_session.query(Agent).filter(
+        Agent.is_system == True, Agent.enabled == True
+    ).all()
+
+    for agent in system_agents:
+        bindings[agent.stage_type] = AgentBinding(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            stage_type=agent.stage_type,
+            skill_name=agent.skill_name,
+            model_id=agent.model_id,
+            skill_config=agent.skill_config or {},
+            model_config=agent.model_config or {},
+            policy_config=agent.policy_config or {},
+        )
+
+    # ── Layer 2: Repo bindings overlay ────────────────────────────────────
     bindings_raw = getattr(repo, "agent_bindings", None) or {}
-    if not bindings_raw:
-        return None
-
-    # Collect agent IDs from the binding map
     agent_ids = {aid for aid in bindings_raw.values() if isinstance(aid, int)}
-    if not agent_ids:
-        return None
 
-    # Load Agent records from DB
-    agents_by_id: dict[int, Agent] = {}
-    for agent in sync_session.query(Agent).filter(Agent.id.in_(agent_ids)).all():
-        if agent.enabled:
-            agents_by_id[agent.id] = agent
+    if agent_ids:
+        repo_agents: dict[int, Agent] = {}
+        for agent in sync_session.query(Agent).filter(Agent.id.in_(agent_ids)).all():
+            if agent.enabled:
+                repo_agents[agent.id] = agent
 
-    if not agents_by_id:
-        logger.warning("agent_resolver.no_enabled_agents", agent_ids=list(agent_ids))
-        return None
+        for stage_type, agent_id in bindings_raw.items():
+            agent = repo_agents.get(agent_id)
+            if not agent:
+                logger.warning(
+                    "agent_resolver.repo_agent_not_found",
+                    stage_type=stage_type, agent_id=agent_id,
+                )
+                continue
+            bindings[stage_type] = AgentBinding(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                stage_type=stage_type,
+                skill_name=agent.skill_name,
+                model_id=agent.model_id,
+                skill_config=agent.skill_config or {},
+                model_config=agent.model_config or {},
+                policy_config=agent.policy_config or {},
+            )
 
-    # Collect unique model IDs needed
-    model_ids = {
-        a.model_id for a in agents_by_id.values()
-        if a.model_id is not None
-    }
-
-    # Build engines for each unique model
+    # ── Build engines for all referenced models ───────────────────────────
+    model_ids = {b.model_id for b in bindings.values() if b.model_id is not None}
     engines_by_id: dict[int, Any] = {}
+
     if model_ids:
         for model in sync_session.query(AIModel).filter(AIModel.id.in_(model_ids)).all():
             try:
@@ -156,29 +192,13 @@ def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> Optional[A
                     model_id=model.id, error=str(exc),
                 )
 
-    # Build binding map: stage_type → AgentBinding
-    bindings: dict[str, AgentBinding] = {}
-    for stage_type, agent_id in bindings_raw.items():
-        agent = agents_by_id.get(agent_id)
-        if not agent:
-            logger.warning(
-                "agent_resolver.agent_not_found_or_disabled",
-                stage_type=stage_type, agent_id=agent_id,
-            )
-            continue
-        bindings[stage_type] = AgentBinding(
-            agent_id=agent.id,
-            agent_name=agent.name,
-            stage_type=stage_type,
-            skill_name=agent.skill_name,
-            model_id=agent.model_id,
-            skill_config=agent.skill_config or {},
-            model_config=agent.model_config or {},
-            policy_config=agent.policy_config or {},
-        )
-
-    if not bindings:
-        return None
+    logger.info(
+        "agent_resolver.built",
+        system_agent_count=len(system_agents),
+        repo_binding_count=len(bindings_raw),
+        total_bindings=len(bindings),
+        model_count=len(engines_by_id),
+    )
 
     return AgentResolver(
         _bindings=bindings,
