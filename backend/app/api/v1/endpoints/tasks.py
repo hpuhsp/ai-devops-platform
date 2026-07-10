@@ -8,7 +8,7 @@ import asyncio
 import json
 
 from app.core.database import get_db, AsyncSessionLocal
-from app.models import AITask
+from app.models import AITask, AgentExecution
 
 router = APIRouter()
 
@@ -16,62 +16,155 @@ router = APIRouter()
 def _build_pipeline_nodes(task: AITask) -> dict:
     """Derive per-node status from output_data and overall task status."""
     od = task.output_data or {}
-    overall = task.status  # pending / running / success / failed
+    overall = task.status  # created/analyzing/generating/executing/repairing/success/failed
+
+    _ACTIVE = {"created", "analyzing", "generating", "executing", "repairing", "pending", "running"}
+    _EXPLICIT_STATUSES = {"failed", "blocked", "skipped"}
 
     def _node(key: str, build_fn) -> dict:
         if key in od:
             return build_fn(od[key])
-        # Not written yet — infer from overall status
-        if overall in ("pending", "running"):
+        if overall in _ACTIVE:
             return {"status": "pending"}
         return {"status": "skipped"}
 
+    def _explicit_node(data: dict) -> dict | None:
+        status = data.get("status")
+        if status not in _EXPLICIT_STATUSES:
+            return None
+        node = {"status": status}
+        for key in ("reason", "error", "blocked_by"):
+            if data.get(key):
+                node[key] = data.get(key)
+        return node
+
     def _cr_node(data: dict) -> dict:
+        explicit = _explicit_node(data)
         blocked = data.get("blocked", False)
-        return {
-            "status": "blocked" if blocked else "done",
+        node = {
+            "status": explicit["status"] if explicit else ("blocked" if blocked else "done"),
             "score": data.get("score"),
             "findings": len(data.get("findings", [])),
             "critical_count": data.get("critical_count", 0),
             "high_count": data.get("high_count", 0),
         }
+        if explicit:
+            node.update({k: v for k, v in explicit.items() if k != "status"})
+        return node
 
     def _tg_node(data: dict) -> dict:
+        explicit = _explicit_node(data)
         wr = data.get("worktree_run", {})
         wr_status = wr.get("status", "unknown")
-        # "running" when worktree_run key is absent but test_generation key exists
-        return {
-            "status": wr_status if wr_status != "unknown" else "running",
+        reason = data.get("reason") or wr.get("reason") or data.get("error") or wr.get("error")
+        status = wr_status if wr_status != "unknown" else "running"
+        if explicit:
+            status = explicit["status"]
+        elif wr_status == "skipped" and reason:
+            status = "failed"
+        node = {
+            "status": status,
             "framework": data.get("framework"),
             "files_count": len(data.get("generated_files", [])),
             "pytest_status": wr.get("status"),
             "pytest_passed": _count_from_stdout(wr.get("stdout", ""), "passed"),
             "pytest_failed": _count_from_stdout(wr.get("stdout", ""), "failed"),
+            "repair_rounds": wr.get("repair_rounds", 0),
+            "repair_history": data.get("repair_history", []),
         }
+        if reason:
+            node["reason"] = reason
+        return node
 
     def _am_node(data: dict) -> dict:
+        explicit = _explicit_node(data)
+        if explicit:
+            return {
+                **explicit,
+                "message": data.get("message", explicit.get("reason", "")),
+            }
         return {
             "status": "done" if data.get("success") else "failed",
             "message": data.get("message", ""),
         }
 
     cr = _node("code_review", _cr_node)
-    # If overall task is running and code_review is already done, mark tg as running
-    if overall == "running" and cr.get("status") in ("done", "blocked"):
-        tg_default = {"status": "running"}
-    else:
-        tg_default = {"status": "pending"}
 
-    tg = od["test_generation"] and _tg_node(od["test_generation"]) if "test_generation" in od else tg_default
+    # Change Intelligence node
+    def _ci_node(data: dict) -> dict:
+        explicit = _explicit_node(data)
+        if explicit:
+            return {
+                **explicit,
+                "need_test": data.get("need_test", False),
+                "risk_level": data.get("risk_level", "none"),
+                "impact_radius": data.get("impact_radius", 0),
+                "targets_count": len(data.get("targets", [])),
+            }
+        return {
+            "status": "skip" if not data.get("need_test") else "done",
+            "need_test": data.get("need_test", False),
+            "risk_level": data.get("risk_level", "none"),
+            "impact_radius": data.get("impact_radius", 0),
+            "targets_count": len(data.get("targets", [])),
+        }
+    ci = _node("change_intelligence", _ci_node)
+
+    tg_raw = od.get("test_generation")
+    if tg_raw and tg_raw.get("status") == "skipped":
+        tg = {"status": "skipped", "reason": tg_raw.get("reason", "")}
+    elif tg_raw:
+        tg = _tg_node(tg_raw)
+    elif overall in ("generating", "executing", "repairing"):
+        tg = {"status": "running"}
+    elif overall in _ACTIVE:
+        tg = {"status": "pending"}
+    else:
+        tg = {"status": "skipped"}
+        if od.get("summary") == "No diff to review":
+            tg["reason"] = "No diff to review"
     am = _node("auto_merge", _am_node)
+
+    # Quality score node
+    def _qs_node(data: dict) -> dict:
+        explicit = _explicit_node(data)
+        if explicit:
+            return {
+                **explicit,
+                "total_score": data.get("total_score"),
+                "dimensions": data.get("dimensions", {}),
+                "risk_level": data.get("risk_level"),
+            }
+        return {
+            "status": "done",
+            "total_score": data.get("total_score"),
+            "dimensions": data.get("dimensions", {}),
+            "risk_level": data.get("risk_level"),
+        }
+    qs = _node("quality_score", _qs_node)
+
+    if tg.get("status") in ("failed", "blocked"):
+        block_reason = tg.get("reason") or "Blocked because test_generation failed"
+        if "quality_score" not in od:
+            qs = {
+                "status": "blocked",
+                "blocked_by": "test_generation",
+                "reason": block_reason,
+            }
+        if "auto_merge" not in od:
+            am = {
+                "status": "blocked",
+                "blocked_by": "test_generation",
+                "message": block_reason,
+                "reason": block_reason,
+            }
 
     return {
         "code_review": cr,
+        "change_intelligence": ci,
         "test_generation": tg,
+        "quality_score": qs,
         "auto_merge": am,
-        # Phase 2 placeholders
-        "ci_build": {"status": "phase2"},
-        "deploy": {"status": "phase2"},
     }
 
 
@@ -83,10 +176,18 @@ def _count_from_stdout(stdout: str, keyword: str) -> int:
 
 def _task_to_event(task: AITask) -> dict:
     ti = task.trigger_event or {}
+    pipeline = _build_pipeline_nodes(task)
+    status = task.status
+    if status == "success" and any(
+        node.get("status") in ("failed", "blocked")
+        for node in pipeline.values()
+        if isinstance(node, dict)
+    ):
+        status = "failed"
     return {
         "task_id": task.task_id,
         "repo_id": task.repo_id,
-        "status": task.status,
+        "status": status,
         "branch": ti.get("branch", ""),
         "commit_sha": (ti.get("commit_sha") or "")[:8],
         "author": ti.get("author", ""),
@@ -95,7 +196,7 @@ def _task_to_event(task: AITask) -> dict:
         "duration_ms": task.duration_ms,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-        "pipeline": _build_pipeline_nodes(task),
+        "pipeline": pipeline,
     }
 
 
@@ -213,6 +314,30 @@ async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
         "input_data": task.input_data,
         "output_data": task.output_data,
     }
+
+
+@router.get("/{task_id}/agents")
+async def list_task_agents(task_id: str, db: AsyncSession = Depends(get_db)):
+    """Agent execution chain for a given task (Change Intel → Generator → Validator → Repair)."""
+    rows = (await db.execute(
+        select(AgentExecution)
+        .where(AgentExecution.task_id == task_id)
+        .order_by(AgentExecution.created_at)
+    )).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "agent_type": r.agent_type,
+            "round_number": r.round_number,
+            "status": r.status,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "duration_ms": r.duration_ms,
+            "output_data": r.output_data,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
 
 
 @router.get("/{task_id}/logs")

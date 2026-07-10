@@ -12,7 +12,7 @@ logger = structlog.get_logger()
 
 ALL_STAGES = ["code_review", "test_generation", "auto_merge", "build", "deploy"]
 
-# Built-in Git Flow template (applied when user selects template)
+# Built-in branch strategy templates (applied when user selects a template)
 TEMPLATES: dict[str, list[dict]] = {
     "gitflow": [
         {"name": "feature/* — 审核+单测",      "pattern": "feature/*",  "stages": ["code_review", "test_generation"],                     "priority": 80},
@@ -27,6 +27,23 @@ TEMPLATES: dict[str, list[dict]] = {
         {"name": "main — 审核+单测",            "pattern": "main",       "stages": ["code_review", "test_generation"],                     "priority": 90},
         {"name": "feature/* — 审核+单测",       "pattern": "feature/*",  "stages": ["code_review", "test_generation"],                     "priority": 50},
         {"name": "默认兜底 — 仅审核",           "pattern": "*",          "stages": ["code_review"],                                         "priority": 1},
+    ],
+    "github_flow": [
+        {"name": "main — 主干全量校验",          "pattern": "main",       "stages": ["code_review", "test_generation", "auto_merge"],        "priority": 90},
+        {"name": "master — 主干全量校验",        "pattern": "master",     "stages": ["code_review", "test_generation", "auto_merge"],        "priority": 89},
+        {"name": "feature/* — PR审核+单测",      "pattern": "feature/*",  "stages": ["code_review", "test_generation"],                     "priority": 70},
+        {"name": "bugfix/* — PR审核+单测",       "pattern": "bugfix/*",   "stages": ["code_review", "test_generation"],                     "priority": 60},
+        {"name": "hotfix/* — 快速审核+单测",     "pattern": "hotfix/*",   "stages": ["code_review", "test_generation"],                     "priority": 50},
+        {"name": "默认兜底 — 仅审核",            "pattern": "*",          "stages": ["code_review"],                                         "priority": 1},
+    ],
+    "gitlab_flow": [
+        {"name": "feature/* — 审核+单测",        "pattern": "feature/*",  "stages": ["code_review", "test_generation"],                     "priority": 90},
+        {"name": "main — 集成分支校验",          "pattern": "main",       "stages": ["code_review", "test_generation"],                     "priority": 80},
+        {"name": "master — 集成分支校验",        "pattern": "master",     "stages": ["code_review", "test_generation"],                     "priority": 79},
+        {"name": "staging — 预发全量校验",       "pattern": "staging",    "stages": ["code_review", "test_generation", "auto_merge"],        "priority": 70},
+        {"name": "production — 生产发布门禁",    "pattern": "production", "stages": ["code_review", "test_generation", "auto_merge"],        "priority": 60},
+        {"name": "hotfix/* — 热修全量校验",      "pattern": "hotfix/*",   "stages": ["code_review", "test_generation", "auto_merge"],        "priority": 50},
+        {"name": "默认兜底 — 仅审核",            "pattern": "*",          "stages": ["code_review"],                                         "priority": 1},
     ],
     "review_only": [
         {"name": "所有分支 — 仅审核",           "pattern": "*",          "stages": ["code_review"],                                         "priority": 1},

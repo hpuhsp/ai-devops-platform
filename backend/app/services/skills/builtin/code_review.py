@@ -38,6 +38,7 @@ SYSTEM_PROMPT = """你是一位资深代码审查专家。请对提供的代码 
 
 class CodeReviewSkill(SkillBase):
     name = "code_review"
+    stage_type = "code_review"
     description = "AI-powered code review on git diff"
     default_config = {
         "max_diff_lines": 5000,

@@ -89,16 +89,45 @@ def _parse_pytest_summary(stdout: str) -> tuple[int, int, str]:
     return passed, failed, summary_line
 
 
-def _build_test_gen_card(data: dict, context: dict, worktree_run: dict | None = None) -> dict:
+def _build_test_gen_card(data: dict, context: dict, worktree_run: dict | None = None, quality_score: dict | None = None) -> dict:
     """Build card for test generation + optional pytest run results."""
     files_count = len(data.get("files", []))
     framework = data.get("framework", "unknown")
-    coverage = data.get("estimated_coverage_delta", "N/A")
+    estimated = data.get("estimated_coverage_delta", "N/A")
 
     # Default state: no pytest run yet
     pytest_section = ""
     header_color = "green"
     header_title = "🧪 AI 单测生成完成"
+
+    # Prefer the real number from pytest-cov when present; the LLM estimate
+    # is kept as a second line so users can compare.
+    measured = (worktree_run or {}).get("measured_coverage_delta")
+    if measured:
+        coverage_line = f"**实测覆盖率 (pytest-cov)**: {measured}"
+        if estimated and estimated != "N/A":
+            coverage_line += f"\n**LLM 预估**: {estimated}"
+    else:
+        coverage_line = f"**预估覆盖率提升**: {estimated}"
+
+    # Risk level label
+    risk_section = ""
+    if quality_score:
+        risk_level = quality_score.get("risk_level", "low")
+        risk_reason = quality_score.get("risk_reason", "")
+        total = quality_score.get("total_score", 0)
+        risk_config = {
+            "high": {"emoji": "🔴", "text": "高风险 — 建议人工 Review", "color": "red"},
+            "medium": {"emoji": "🟡", "text": "中风险 — 建议补充测试", "color": "yellow"},
+            "low": {"emoji": "🟢", "text": "低风险 — 可放心合并", "color": "green"},
+        }
+        risk_info = risk_config.get(risk_level, risk_config["low"])
+        risk_section = f"\n\n---\n**风险建议**: {risk_info['emoji']} {risk_info['text']}\n**质量评分**: {total}/10"
+        if risk_reason:
+            risk_section += f"\n**原因**: {risk_reason}"
+        # Override header color if risk is high
+        if risk_level == "high":
+            header_color = "red"
 
     if worktree_run:
         run_status = worktree_run.get("status", "unknown")
@@ -152,7 +181,8 @@ def _build_test_gen_card(data: dict, context: dict, worktree_run: dict | None = 
                             f"**分支**: `{context.get('branch', '')}` | **提交**: `{context.get('commit', '')}`\n\n"
                             f"**测试框架**: {framework}\n"
                             f"**生成文件数**: {files_count}\n"
-                            f"**预估覆盖率提升**: {coverage}"
+                            f"{coverage_line}"
+                            f"{risk_section}"
                             f"{pytest_section}"
                         ),
                     }
@@ -211,7 +241,16 @@ class FeishuWebhookProvider(NotificationProvider):
             card = _build_test_gen_card(
                 message.data.get("data", {}),
                 message.data.get("context", {}),
-                worktree_run=message.data.get("worktree_run"),
+                worktree_run=message.data.get("data", {}).get("worktree_run"),
+                quality_score=message.data.get("quality_score"),
+            )
+            return {**base, **card}
+        elif message.message_type == "quality_score_result" and message.data:
+            card = _build_test_gen_card(
+                message.data.get("data", {}),
+                message.data.get("context", {}),
+                worktree_run=message.data.get("data", {}).get("worktree_run"),
+                quality_score=message.data.get("quality_score"),
             )
             return {**base, **card}
 

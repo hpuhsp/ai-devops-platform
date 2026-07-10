@@ -44,6 +44,24 @@
 
 /* ─── Node dot states ───────────────────────────────────────────────────── */
 
+/* Repairing — orange pulse (Sprint D) */
+@keyframes pulse-ring-orange {
+  0%   { box-shadow: 0 0 0 0   rgba(250, 140, 22, 0.55); }
+  70%  { box-shadow: 0 0 0 8px rgba(250, 140, 22, 0);    }
+  100% { box-shadow: 0 0 0 0   rgba(250, 140, 22, 0);    }
+}
+
+.pipeline-node-repairing .pipeline-dot {
+  animation: pulse-ring-orange 1.4s ease-out infinite;
+  border-color: #fa8c16 !important;
+  background: #fff7e6 !important;
+}
+
+.pipeline-node-repairing .pipeline-icon {
+  animation: spin 1s linear infinite;
+  color: #fa8c16;
+}
+
 .pipeline-node-running .pipeline-dot {
   animation: pulse-ring 1.4s ease-out infinite;
   border-color: #1677ff !important;

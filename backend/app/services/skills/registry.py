@@ -15,6 +15,14 @@ logger = structlog.get_logger()
 
 
 class SkillRegistry:
+    STAGE_DESCRIPTIONS = {
+        "code_review": "代码审查 — 审查diff中的安全和质量问题",
+        "change_intelligence": "变更智能 — 分析变更是否需要测试",
+        "generator": "单元测试生成 — 基于上下文生成测试用例",
+        "validate_repair": "验证修复 — WorkTree沙箱执行+自动修复",
+        "quality_scorer": "质量评分 — 4维度评估测试质量",
+    }
+
     def __init__(self):
         self._skills: dict[str, Type[SkillBase]] = {}
         self._load_builtin_skills()
@@ -54,6 +62,18 @@ class SkillRegistry:
 
     def list_skills(self) -> list[str]:
         return list(self._skills.keys())
+
+    def list_skills_metadata(self) -> list[dict]:
+        """Return metadata for all registered skills."""
+        return [cls.metadata() for cls in self._skills.values()]
+
+    def list_by_stage(self, stage_type: str) -> list[dict]:
+        """Return skills available for a given stage type."""
+        return [cls.metadata() for cls in self._skills.values() if cls.stage_type == stage_type]
+
+    def get_stage_types(self) -> list[dict]:
+        """Return all stage types with descriptions."""
+        return [{"value": k, "label": v} for k, v in self.STAGE_DESCRIPTIONS.items()]
 
     def load_project_config(self, config_path: str) -> dict:
         """Load .ai-skills.yml from project root (if present)."""

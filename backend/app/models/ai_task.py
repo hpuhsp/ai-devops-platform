@@ -11,7 +11,7 @@ class AITask(Base):
     task_id = Column(String(100), unique=True, nullable=False)  # Celery task ID
     repo_id = Column(Integer, ForeignKey("repositories.id"), nullable=True, index=True)
     task_type = Column(String(50), nullable=False)  # code_review/test_generation/auto_merge
-    status = Column(String(20), nullable=False, default="pending", index=True)  # pending/running/success/failed
+    status = Column(String(20), nullable=False, default="created", index=True)  # created/analyzing/generating/executing/repairing/success/failed
     trigger_event = Column(JSONB)           # raw webhook event
     input_data = Column(JSONB)
     output_data = Column(JSONB)

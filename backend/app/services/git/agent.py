@@ -6,6 +6,8 @@ import os
 import subprocess
 import shutil
 import uuid
+import hashlib
+import time
 from pathlib import Path
 import structlog
 
@@ -15,6 +17,8 @@ logger = structlog.get_logger()
 
 REPOS_BASE_DIR = Path("/tmp/ai-devops-repos")
 WORKTREE_BASE_DIR = Path(settings.WORKTREE_BASE_DIR)
+REPO_CACHE_TTL_SECONDS = int(os.getenv("REPO_CACHE_TTL_SECONDS", str(14 * 24 * 60 * 60)))
+REPO_CACHE_LAST_ACCESS = ".last_access"
 
 
 class GitAgent:
@@ -23,9 +27,17 @@ class GitAgent:
         self.git_token = git_token
         self._authenticated_url = self._build_auth_url()
         repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
-        self.local_path = REPOS_BASE_DIR / repo_name
+        repo_hash = hashlib.sha1(self._normalized_cache_url().encode("utf-8")).hexdigest()[:12]
+        self.local_path = REPOS_BASE_DIR / f"{repo_name}-{repo_hash}"
         REPOS_BASE_DIR.mkdir(parents=True, exist_ok=True)
         WORKTREE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cleanup_stale_repo_caches()
+
+    def _normalized_cache_url(self) -> str:
+        url = self.repo_url.split("#")[0].rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        return url.lower()
 
     def _build_auth_url(self) -> str:
         """Inject token into HTTPS URL for authentication. Ensure .git suffix for clone."""
@@ -48,6 +60,36 @@ class GitAgent:
             check=check,
         )
 
+    @classmethod
+    def cleanup_stale_repo_caches(cls, ttl_seconds: int = REPO_CACHE_TTL_SECONDS) -> int:
+        """Remove repo caches that have not been accessed within ttl_seconds."""
+        if ttl_seconds <= 0 or not REPOS_BASE_DIR.exists():
+            return 0
+
+        now = time.time()
+        removed = 0
+        for path in REPOS_BASE_DIR.iterdir():
+            if not path.is_dir():
+                continue
+            marker = path / REPO_CACHE_LAST_ACCESS
+            try:
+                last_access = marker.stat().st_mtime if marker.exists() else path.stat().st_mtime
+            except OSError:
+                continue
+            if now - last_access <= ttl_seconds:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+            logger.info("git.cache_removed", path=str(path), ttl_seconds=ttl_seconds)
+        return removed
+
+    def _touch_cache(self) -> None:
+        try:
+            self.local_path.mkdir(parents=True, exist_ok=True)
+            (self.local_path / REPO_CACHE_LAST_ACCESS).touch()
+        except OSError as exc:
+            logger.warning("git.cache_touch_failed", path=str(self.local_path), error=str(exc))
+
     def ensure_repo(self) -> Path:
         """Clone repo if not exists, otherwise fetch latest."""
         if self.local_path.exists():
@@ -68,7 +110,58 @@ class GitAgent:
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
             logger.info("git.cloned", url=self.repo_url, path=str(self.local_path))
+        self._touch_cache()
         return self.local_path
+
+    @staticmethod
+    def _is_safe_branch(branch: str) -> bool:
+        return bool(branch) and not any(part in branch for part in ("..", "~", "^", ":", "\\", "?", "*", "["))
+
+    def fetch_branch(self, branch: str) -> bool:
+        """Fetch one branch into the local bare cache."""
+        if not self._is_safe_branch(branch):
+            logger.warning("git.fetch_branch_unsafe", branch=branch)
+            return False
+        self.ensure_repo()
+        result = self._run(
+            ["git", "fetch", "origin", f"+refs/heads/{branch}:refs/heads/{branch}"],
+            check=False,
+        )
+        if result.returncode == 0:
+            self._touch_cache()
+            logger.info("git.branch_fetched", branch=branch)
+            return True
+        logger.warning("git.branch_fetch_failed", branch=branch, error=result.stderr.strip()[:500])
+        return False
+
+    def has_commit(self, commit_sha: str) -> bool:
+        if not commit_sha:
+            return False
+        result = self._run(["git", "cat-file", "-e", f"{commit_sha}^{{commit}}"], check=False)
+        return result.returncode == 0
+
+    def ensure_commit(self, commit_sha: str, branch: str = "") -> None:
+        """Ensure a commit object exists locally, fetching the branch once if needed."""
+        self.ensure_repo()
+        if self.has_commit(commit_sha):
+            self._touch_cache()
+            return
+
+        if branch:
+            self.fetch_branch(branch)
+            if self.has_commit(commit_sha):
+                self._touch_cache()
+                return
+
+        result = self._run(["git", "fetch", "--all", "--prune"], check=False)
+        if result.returncode == 0 and self.has_commit(commit_sha):
+            self._touch_cache()
+            return
+
+        raise RuntimeError(
+            f"Unable to find commit {commit_sha} in local cache after fetch. "
+            f"Branch='{branch or '-'}'. Check Git token permissions and whether the branch was pushed."
+        )
 
     def get_diff(self, base_ref: str, head_ref: str) -> tuple[str, list[str]]:
         """Get diff between two refs. Returns (diff_text, changed_files)."""
@@ -86,9 +179,9 @@ class GitAgent:
 
         return diff_text, changed_files
 
-    def get_commit_diff(self, commit_sha: str) -> tuple[str, list[str]]:
+    def get_commit_diff(self, commit_sha: str, branch: str = "") -> tuple[str, list[str]]:
         """Get diff for a single commit."""
-        self.ensure_repo()
+        self.ensure_commit(commit_sha, branch)
         diff_result = self._run(["git", "show", "--no-color", commit_sha])
         files_result = self._run(["git", "diff-tree", "--no-commit-id", "-r", "--name-only", commit_sha])
         changed_files = [f for f in files_result.stdout.strip().split("\n") if f]
@@ -168,6 +261,69 @@ class GitAgent:
         return None
 
 
+    def push_ai_branch(
+        self,
+        base_ref: str,
+        branch_name: str,
+        files: list[dict],
+        commit_message: str = "chore(ai): add generated unit tests",
+    ) -> dict:
+        """
+        Create an AI branch from base_ref, write test files, commit, and push.
+        Returns {"success": bool, "branch": str, "commit_sha": str | None, "error": str | None}
+        """
+        self.ensure_repo()
+        worktree_path = WORKTREE_BASE_DIR / f"push-{uuid.uuid4().hex[:8]}"
+
+        try:
+            # Create worktree at base_ref
+            self._run(["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_ref])
+
+            # Write files
+            for f in files:
+                fp = worktree_path / f["path"]
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(f["content"])
+
+            # Stage and commit
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(worktree_path), capture_output=True, text=True, check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", commit_message],
+                cwd=str(worktree_path), capture_output=True, text=True, check=True,
+            )
+            sha_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(worktree_path), capture_output=True, text=True, check=True,
+            )
+            commit_sha = sha_result.stdout.strip()
+
+            # Push to remote
+            push_result = subprocess.run(
+                ["git", "push", self._authenticated_url, f"HEAD:refs/heads/{branch_name}"],
+                cwd=str(worktree_path), capture_output=True, text=True, check=False,
+            )
+            if push_result.returncode != 0:
+                return {
+                    "success": False, "branch": branch_name,
+                    "commit_sha": None, "error": push_result.stderr[:500],
+                }
+
+            logger.info("git.ai_branch_pushed", branch=branch_name, sha=commit_sha[:8])
+            return {"success": True, "branch": branch_name, "commit_sha": commit_sha, "error": None}
+
+        except Exception as exc:
+            logger.error("git.push_ai_branch_failed", error=str(exc))
+            return {"success": False, "branch": branch_name, "commit_sha": None, "error": str(exc)}
+        finally:
+            try:
+                self._run(["git", "worktree", "remove", "--force", str(worktree_path)])
+            except Exception:
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+
 class WorkTree:
     """Isolated git worktree for running tests without polluting main repo."""
 
@@ -220,6 +376,51 @@ class WorkTree:
         except Exception:
             shutil.rmtree(self.path, ignore_errors=True)
         logger.info("worktree.cleaned", path=str(self.path))
+
+    def read_coverage(self, filename: str = "coverage.xml") -> dict:
+        """Parse a Cobertura coverage.xml produced by pytest-cov.
+
+        Returns a dict with total line-rate (percent), lines-run, lines-covered,
+        and a per-file breakdown. Returns an empty dict if the file is missing or
+        malformed — callers must treat this as "coverage not measured".
+        """
+        import xml.etree.ElementTree as ET
+
+        cov_path = self.path / filename
+        if not cov_path.exists():
+            logger.info("worktree.coverage_missing", path=str(cov_path))
+            return {}
+        try:
+            tree = ET.parse(str(cov_path))
+            root = tree.getroot()
+            line_rate = float(root.attrib.get("line-rate", "0"))
+            lines_valid = int(root.attrib.get("lines-valid", "0"))
+            lines_covered = int(root.attrib.get("lines-covered", "0"))
+
+            per_file: dict[str, dict] = {}
+            for pkg in root.findall(".//package"):
+                for cls in pkg.findall(".//class"):
+                    name = cls.attrib.get("filename", "")
+                    lr = float(cls.attrib.get("line-rate", "0"))
+                    lv = int(cls.attrib.get("lines-valid", "0"))
+                    lc = int(cls.attrib.get("lines-covered", "0"))
+                    if name:
+                        per_file[name] = {
+                            "line_rate": round(lr * 100, 2),
+                            "lines_valid": lv,
+                            "lines_covered": lc,
+                        }
+
+            return {
+                "line_rate": round(line_rate * 100, 2),
+                "lines_valid": lines_valid,
+                "lines_covered": lines_covered,
+                "files": per_file,
+            }
+        except Exception as exc:
+            logger.warning("worktree.coverage_parse_error", error=str(exc), path=str(cov_path))
+            return {}
+
 
     def __enter__(self):
         return self

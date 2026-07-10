@@ -99,7 +99,8 @@ async def list_templates():
     return [
         {"key": "gitflow",     "label": "标准 Git Flow",   "description": "feature→审核+单测 / develop→+合并 / hotfix→审核+合并"},
         {"key": "trunk",       "label": "Trunk-Based",     "description": "main分支全量，feature仅审核+单测"},
-        {"key": "review_only", "label": "纯审核模式",       "description": "所有分支仅执行代码审查"},
+        {"key": "github_flow", "label": "GitHub Flow",     "description": "main主干保护，短生命周期feature/bugfix/hotfix分支通过PR校验"},
+        {"key": "gitlab_flow", "label": "GitLab Flow",     "description": "feature→main→staging→production，按环境分支逐级增强校验"},
     ]
 
 

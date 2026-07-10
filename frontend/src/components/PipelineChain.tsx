@@ -4,9 +4,17 @@ import {
   CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined,
   StopOutlined, ExperimentOutlined, MergeCellsOutlined,
   BuildOutlined, RocketOutlined, CodeOutlined, MinusCircleOutlined,
+  BulbOutlined, TrophyOutlined, WarningOutlined,
 } from '@ant-design/icons'
 import '../styles/pipeline.css'
 import { streamEvent } from '../services/api'
+
+export interface QualityDimensions {
+  business_coverage?: number
+  scenario_coverage?: number
+  maintainability?: number
+  execution_success?: number
+}
 
 export interface PipelineNode {
   status: string
@@ -14,11 +22,17 @@ export interface PipelineNode {
   framework?: string; files_count?: number
   pytest_status?: string; pytest_passed?: number; pytest_failed?: number
   message?: string
+  reason?: string
+  need_test?: boolean; risk_level?: string; impact_radius?: number; targets_count?: number
+  total_score?: number; dimensions?: QualityDimensions; suggestions?: string[]
+  repair_rounds?: number; repair_history?: any[]
 }
 
 export interface Pipeline {
   code_review: PipelineNode
+  change_intelligence?: PipelineNode
   test_generation: PipelineNode
+  quality_score?: PipelineNode
   auto_merge: PipelineNode
   ci_build?: PipelineNode
   deploy?: PipelineNode
@@ -41,11 +55,13 @@ const NODE_META: Array<{
   Icon: React.ComponentType<any>
   phase2?: boolean
 }> = [
-  { key: 'code_review',    label: '代码审查', shortLabel: '审查', Icon: CodeOutlined },
-  { key: 'test_generation',label: '单元测试', shortLabel: '单测', Icon: ExperimentOutlined },
-  { key: 'auto_merge',     label: '智能合并', shortLabel: '合并', Icon: MergeCellsOutlined },
-  { key: 'ci_build',       label: 'CI 构建',  shortLabel: '构建', Icon: BuildOutlined,  phase2: true },
-  { key: 'deploy',         label: '自动发布', shortLabel: '发布', Icon: RocketOutlined, phase2: true },
+  { key: 'code_review',         label: '代码审查', shortLabel: '审查', Icon: CodeOutlined },
+  { key: 'change_intelligence', label: '变更智能', shortLabel: '变更', Icon: BulbOutlined },
+  { key: 'test_generation',     label: '单元测试', shortLabel: '单测', Icon: ExperimentOutlined },
+  { key: 'quality_score',       label: '质量评分', shortLabel: '质量', Icon: TrophyOutlined },
+  { key: 'auto_merge',          label: '智能合并', shortLabel: '合并', Icon: MergeCellsOutlined },
+  { key: 'ci_build',            label: 'CI 构建',  shortLabel: '构建', Icon: BuildOutlined,  phase2: true },
+  { key: 'deploy',              label: '自动发布', shortLabel: '发布', Icon: RocketOutlined, phase2: true },
 ]
 
 // ── Status → CSS class ───────────────────────────────────────────────────────
@@ -53,9 +69,10 @@ const NODE_META: Array<{
 function nodeClass(node: PipelineNode | undefined, phase2?: boolean): string {
   if (phase2) return 'pipeline-node pipeline-node-phase2'
   if (!node)  return 'pipeline-node pipeline-node-pending'
-  const s = node.pytest_status === 'passed' ? 'done'
+  const raw = node.pytest_status === 'passed' ? 'done'
            : node.pytest_status === 'failed' ? 'failed'
            : node.status
+  const s = raw === 'skip' ? 'skipped' : raw
   return `pipeline-node pipeline-node-${s}`
 }
 
@@ -64,7 +81,7 @@ function NodeIcon({ node, Meta, phase2 }: { node: PipelineNode | undefined; Meta
   if (phase2) return <Icon className="pipeline-icon" style={{ color: '#bfbfbf', fontSize: 14 }} />
   if (!node || node.status === 'pending') return <ClockCircleOutlined className="pipeline-icon" style={{ color: '#d9d9d9', fontSize: 14 }} />
   if (node.status === 'running') return <Spin size="small" />
-  if (node.status === 'skipped') return <MinusCircleOutlined className="pipeline-icon" style={{ color: '#bfbfbf', fontSize: 14 }} />
+  if (node.status === 'skipped' || node.status === 'skip') return <MinusCircleOutlined className="pipeline-icon" style={{ color: '#bfbfbf', fontSize: 14 }} />
   const s = node.pytest_status || node.status
   if (s === 'passed' || s === 'done')    return <CheckCircleOutlined  className="pipeline-icon" style={{ fontSize: 14 }} />
   if (s === 'failed' || s === 'blocked') return <CloseCircleOutlined  className="pipeline-icon" style={{ fontSize: 14 }} />
@@ -74,16 +91,23 @@ function NodeIcon({ node, Meta, phase2 }: { node: PipelineNode | undefined; Meta
 
 function nodeTooltip(key: string, node: PipelineNode | undefined): string {
   if (!node || node.status === 'pending') return '等待中'
-  if (node.status === 'skipped') return '已跳过（分支规则未命中）'
+  if (node.status === 'skipped' || node.status === 'skip') return node.reason || '已跳过'
   if (node.status === 'running') return '执行中…'
   if (key === 'code_review') {
     if (node.status === 'blocked') return `拦截 | Critical:${node.critical_count} High:${node.high_count}`
     return `评分 ${node.score}/100 | ${node.findings} 个问题`
   }
+  if (key === 'change_intelligence') {
+    if (node.status === 'skip') return '无需测试'
+    return `风险: ${node.risk_level || '—'} | 影响: ${node.impact_radius ?? 0} 文件 | 目标: ${node.targets_count ?? 0}`
+  }
   if (key === 'test_generation') {
     if (node.pytest_status === 'passed') return `pytest ✅ ${node.pytest_passed} 个用例通过`
     if (node.pytest_status === 'failed') return `pytest ❌ ${node.pytest_failed} 个用例失败`
     return `生成 ${node.files_count} 个文件`
+  }
+  if (key === 'quality_score') {
+    return `总分 ${node.total_score ?? '—'}/10 | 风险: ${node.risk_level || '—'}`
   }
   if (key === 'auto_merge') return node.message || '智能合并完成'
   return node.status
@@ -93,10 +117,15 @@ function connectorClass(prev: PipelineNode | undefined, cur: PipelineNode | unde
   if (!prev || prev.status === 'pending') return 'pipeline-connector'
   if (prev.status === 'running') return 'pipeline-connector flowing'
   const ps = prev.pytest_status || prev.status
-  if (ps === 'done' || ps === 'passed') return 'pipeline-connector done'
+  if (ps === 'done' || ps === 'passed' || ps === 'skip') return 'pipeline-connector done'
   if (ps === 'failed' || ps === 'blocked') return 'pipeline-connector failed'
   return 'pipeline-connector'
 }
+
+// Terminal statuses where SSE streaming should stop
+const TERMINAL_STATUS = ['success', 'failed']
+// Active statuses that should trigger SSE streaming
+const ACTIVE_STATUS = ['created', 'analyzing', 'generating', 'executing', 'repairing', 'pending', 'running']
 
 // ── Main component ───────────────────────────────────────────────────────────
 
@@ -111,7 +140,7 @@ export default function PipelineChain({ taskId, pipeline: initPipeline, taskStat
   }, [initPipeline, initStatus])
 
   useEffect(() => {
-    if (!taskId || ['success', 'failed'].includes(initStatus || '')) return
+    if (!taskId || TERMINAL_STATUS.includes(initStatus || '')) return
 
     const es = streamEvent(taskId)
     esRef.current = es
@@ -122,7 +151,7 @@ export default function PipelineChain({ taskId, pipeline: initPipeline, taskStat
         setTaskStatus(item.status)
         onUpdate?.(item.pipeline)
       }
-      if (['success', 'failed'].includes(item.status)) es.close()
+      if (TERMINAL_STATUS.includes(item.status)) es.close()
     }
     return () => { es.close() }
   }, [taskId])

@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import MainLayout from './components/MainLayout'
 import DashboardPage from './pages/dashboard/DashboardPage'
 import ModelsPage from './pages/config/ModelsPage'
+import AgentsPage from './pages/config/AgentsPage'
 import RepositoriesPage from './pages/config/RepositoriesPage'
 import NotifyPage from './pages/config/NotifyPage'
 import RulesPage from './pages/config/RulesPage'
@@ -15,6 +16,7 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="config/models" element={<ModelsPage />} />
+        <Route path="config/agents" element={<AgentsPage />} />
         <Route path="config/repositories" element={<RepositoriesPage />} />
         <Route path="config/notify" element={<NotifyPage />} />
         <Route path="config/rules" element={<RulesPage />} />

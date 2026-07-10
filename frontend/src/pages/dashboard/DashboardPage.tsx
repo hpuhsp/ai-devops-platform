@@ -13,9 +13,14 @@ import { useNavigate } from 'react-router-dom'
 
 const { Title, Text } = Typography
 
-const TASK_STATUS_BADGE: Record<string, 'success' | 'processing' | 'default' | 'error'> = {
-  success: 'success', running: 'processing', pending: 'default', failed: 'error',
+const TASK_STATUS_BADGE: Record<string, 'success' | 'processing' | 'default' | 'error' | 'warning'> = {
+  created: 'default', analyzing: 'processing', generating: 'processing',
+  executing: 'processing', repairing: 'processing',
+  success: 'success', failed: 'error',
+  pending: 'default', running: 'processing',
 }
+
+const ACTIVE_STATUS = ['created', 'analyzing', 'generating', 'executing', 'repairing', 'pending', 'running']
 
 export default function DashboardPage() {
   const [overview, setOverview] = useState<any>(null)
@@ -46,7 +51,7 @@ export default function DashboardPage() {
 
   // Auto-refresh every 8s if any event is running
   useEffect(() => {
-    const hasRunning = events.items.some((e: any) => e.status === 'running' || e.status === 'pending')
+    const hasRunning = events.items.some((e: any) => ACTIVE_STATUS.includes(e.status))
     if (!hasRunning) return
     const timer = setInterval(() => { fetchOverview(); fetchEvents(page) }, 8000)
     return () => clearInterval(timer)
@@ -81,7 +86,7 @@ export default function DashboardPage() {
       title: '流水线节点',
       render: (_: any, r: any) => (
         <PipelineChain
-          taskId={r.status === 'running' || r.status === 'pending' ? r.task_id : undefined}
+          taskId={ACTIVE_STATUS.includes(r.status) ? r.task_id : undefined}
           pipeline={r.pipeline}
           taskStatus={r.status}
           compact

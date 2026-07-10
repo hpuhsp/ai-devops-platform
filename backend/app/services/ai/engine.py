@@ -52,15 +52,15 @@ class AIEngine:
     def _resolve_litellm_model(model_id: str, api_base: Optional[str], provider: str = "") -> str:
         """
         LiteLLM requires a provider prefix for models it doesn't recognize.
-        - If model already has a slash (e.g. 'deepseek/deepseek-chat'), use as-is.
         - If api_base is set, treat as an OpenAI-compatible endpoint: prefix 'openai/'.
-          This lets any model name (incl. new ones like deepseek-v4-flash) pass through.
+          This lets any model name or local model path (incl. /data/...) pass through.
+        - If model already has a slash (e.g. 'deepseek/deepseek-chat'), use as-is.
         - Otherwise, fall back to provider prefix if available.
         """
-        if "/" in model_id:
-            return model_id
         if api_base:
             return f"openai/{model_id}"
+        if "/" in model_id:
+            return model_id
         if provider:
             return f"{provider}/{model_id}"
         return model_id

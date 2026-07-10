@@ -13,6 +13,7 @@ const menuItems = [
     key: 'config', icon: <SettingOutlined />, label: '配置管理',
     children: [
       { key: '/config/models', icon: <RobotOutlined />, label: 'AI 模型' },
+      { key: '/config/agents', icon: <RobotOutlined />, label: 'Agent 管理' },
       { key: '/config/repositories', icon: <BranchesOutlined />, label: '代码仓库' },
       { key: '/config/notify', icon: <BellOutlined />, label: '通知配置' },
       { key: '/config/rules', icon: <ApartmentOutlined />, label: '流水线规则' },

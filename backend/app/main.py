@@ -4,8 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import structlog
 
 from app.core.config import settings
-from app.core.database import engine, Base
+from app.core.database import engine, Base, AsyncSessionLocal
 from app.api.v1.router import api_router
+from app.core.init_agents import init_default_agents
 
 logger = structlog.get_logger()
 
@@ -30,6 +31,10 @@ async def lifespan(app: FastAPI):
     if settings.DEBUG:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+    async with AsyncSessionLocal() as session:
+        await init_default_agents(session)
+
     logger.info("app.startup", version=settings.APP_VERSION)
     yield
     # Shutdown

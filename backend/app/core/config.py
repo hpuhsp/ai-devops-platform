@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     # Git WorkTree base directory
     WORKTREE_BASE_DIR: str = "/tmp/ai-devops-worktrees"
 
+    # V2 Agent settings
+    MAX_REPAIR_ROUNDS: int = 3
+    CHANGE_INTEL_SKIP_EXTENSIONS: list[str] = [
+        ".md", ".txt", ".rst", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".json",
+    ]
+    MR_COMMENT_ENABLED: bool = True
+    TEST_QUALITY_SCORING_ENABLED: bool = True
+
     @property
     def DATABASE_PURE_URL(self) -> str:
         """psycopg2-compatible URL (no dialect prefix)."""

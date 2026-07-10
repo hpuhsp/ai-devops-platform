@@ -39,6 +39,9 @@ class SkillBase(ABC):
 
     name: str = "base"
     description: str = ""
+    version: str = "1.0.0"
+    stage_type: str = ""
+    model_required: bool = True
     default_config: dict = {}
 
     def __init__(self, config: dict = None):
@@ -51,3 +54,14 @@ class SkillBase(ABC):
 
     def get_config(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)
+
+    @classmethod
+    def metadata(cls) -> dict:
+        return {
+            "name": cls.name,
+            "description": cls.description,
+            "version": cls.version,
+            "stage_type": cls.stage_type,
+            "model_required": cls.model_required,
+            "default_config": cls.default_config,
+        }

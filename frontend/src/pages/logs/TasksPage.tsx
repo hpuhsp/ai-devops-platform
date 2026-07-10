@@ -5,7 +5,17 @@ import dayjs from 'dayjs'
 import { listTasks } from '../../services/api'
 
 const STATUS_COLOR: Record<string, string> = {
-  pending: 'default', running: 'processing', success: 'success', failed: 'error',
+  created: 'default', analyzing: 'processing', generating: 'processing',
+  executing: 'processing', repairing: 'warning',
+  success: 'success', failed: 'error',
+  pending: 'default', running: 'processing',
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  created: '已创建', analyzing: '分析中', generating: '生成中',
+  executing: '执行中', repairing: '修复中',
+  success: '成功', failed: '失败',
+  pending: '已创建', running: '分析中',
 }
 
 export default function TasksPage() {
@@ -20,7 +30,7 @@ export default function TasksPage() {
   const columns = [
     { title: 'Task ID', dataIndex: 'task_id', render: (v: string) => <code style={{ fontSize: 12 }}>{v.slice(0, 8)}...</code> },
     { title: '类型', dataIndex: 'task_type', render: (v: string) => <Tag>{v}</Tag> },
-    { title: '状态', dataIndex: 'status', render: (v: string) => <Tag color={STATUS_COLOR[v]}>{v}</Tag> },
+    { title: '状态', dataIndex: 'status', render: (v: string) => <Tag color={STATUS_COLOR[v]}>{STATUS_LABEL[v] || v}</Tag> },
     { title: 'Tokens', render: (_: any, r: any) => r.prompt_tokens + r.completion_tokens },
     { title: '耗时', dataIndex: 'duration_ms', render: (v: number) => v ? `${(v / 1000).toFixed(1)}s` : '-' },
     { title: '创建时间', dataIndex: 'created_at', render: (v: string) => dayjs(v).format('MM-DD HH:mm:ss') },
@@ -32,7 +42,15 @@ export default function TasksPage() {
       <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
         <Select
           allowClear placeholder="状态筛选" style={{ width: 140 }}
-          options={['pending', 'running', 'success', 'failed'].map(s => ({ value: s, label: s }))}
+          options={[
+            { value: 'created', label: '已创建' },
+            { value: 'analyzing', label: '分析中' },
+            { value: 'generating', label: '生成中' },
+            { value: 'executing', label: '执行中' },
+            { value: 'repairing', label: '修复中' },
+            { value: 'success', label: '成功' },
+            { value: 'failed', label: '失败' },
+          ]}
           onChange={status => setFilters(f => ({ ...f, status, page: 1 }))}
         />
         <Select

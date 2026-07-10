@@ -25,15 +25,50 @@ SyncSession = sessionmaker(bind=_sync_engine)
 # name the LLM reports. Values are fixed argv lists run WITHOUT a shell — the
 # LLM's own run_command string is intentionally ignored. Frameworks absent here
 # are not executed (test files are still generated and reported).
+# --cov=. measures coverage across the whole target repo (the worktree root),
+# so the reported % reflects how much of the codebase the AI-generated tests
+# actually exercise. coverage.xml is parsed afterwards to extract the number.
 SAFE_TEST_COMMANDS: dict[str, list[str]] = {
-    "pytest": ["pytest", "-q"],
-    "python": ["pytest", "-q"],
-    "unittest": ["python", "-m", "pytest", "-q"],
+    "pytest": ["pytest", "-q", "--cov=.", "--cov-report=xml:coverage.xml", "--cov-report=term"],
+    "python": ["pytest", "-q", "--cov=.", "--cov-report=xml:coverage.xml", "--cov-report=term"],
+    "unittest": ["python", "-m", "pytest", "-q", "--cov=.", "--cov-report=xml:coverage.xml", "--cov-report=term"],
 }
+
+
+COVERAGE_XML_NAME = "coverage.xml"
 
 
 def _safe_test_command(framework: str | None) -> list[str] | None:
     return SAFE_TEST_COMMANDS.get((framework or "").strip().lower())
+
+
+def _select_event_diff(git_agent, before_sha: str, commit_sha: str, branch: str = "") -> tuple[str, list[str]]:
+    """Select the most useful diff for a webhook event.
+
+    GitLab's Webhook Test can send the same SHA for before/after. A range diff
+    for that payload is empty, so fall back to the single commit diff.
+    """
+    all_zeros = "0" * 40
+    if commit_sha and commit_sha != all_zeros:
+        if before_sha and before_sha != all_zeros and before_sha != commit_sha:
+            if hasattr(git_agent, "ensure_commit"):
+                git_agent.ensure_commit(commit_sha, branch)
+            try:
+                return git_agent.get_diff(before_sha, commit_sha)
+            except Exception:
+                logger.warning(
+                    "git.range_diff_failed_fallback_commit",
+                    before_sha=before_sha,
+                    commit_sha=commit_sha,
+                    branch=branch,
+                )
+                return git_agent.get_commit_diff(commit_sha, branch)
+        return git_agent.get_commit_diff(commit_sha, branch)
+
+    try:
+        return git_agent.get_latest_diff()
+    except Exception:
+        return "", []
 
 
 def _run_async(coro):
@@ -74,6 +109,36 @@ def _write_partial_output(task_id: str, key: str, value: dict):
         conn.close()
 
 
+def _record_agent_execution(
+    task_id: str, agent_type: str, status: str,
+    input_data: dict = None, output_data: dict = None,
+    prompt_tokens: int = 0, completion_tokens: int = 0,
+    duration_ms: int = 0, round_number: int = 1,
+):
+    """Insert a row into agent_executions via psycopg2 (thread-safe, no asyncpg)."""
+    import json as _json
+    import psycopg2
+    dsn = settings.DATABASE_PURE_URL
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO agent_executions "
+                "(task_id, agent_type, round_number, input_data, output_data, "
+                " prompt_tokens, completion_tokens, duration_ms, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    task_id, agent_type, round_number,
+                    _json.dumps(input_data) if input_data else None,
+                    _json.dumps(output_data) if output_data else None,
+                    prompt_tokens, completion_tokens, duration_ms, status,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _mark_failed(db: Session, task_id: str, error: str):
     from app.models import AITask
     db.execute(
@@ -85,6 +150,113 @@ def _mark_failed(db: Session, task_id: str, error: str):
     db.commit()
 
 
+def _resolve_notify_config(db: Session, repo, task_id: str) -> dict | None:
+    """Resolve notification channel and repo-level routing settings.
+
+    Repo config lives under skills_config.notifications:
+    {
+      "notify_config_id": 1,              # optional; falls back to default
+      "enabled_events": ["code_review_result"],
+      "min_severity": "high",            # all/low/medium/high/critical
+      "blocked_only": false
+    }
+    """
+    from app.models import NotifyConfig
+
+    repo_settings = ((getattr(repo, "skills_config", None) or {}).get("notifications") or {})
+    notify_config_id = repo_settings.get("notify_config_id")
+
+    query = select(NotifyConfig).where(NotifyConfig.enabled == True)
+    if notify_config_id:
+        query = query.where(NotifyConfig.id == notify_config_id)
+    else:
+        query = query.where(NotifyConfig.is_default == True)
+
+    row = db.execute(query).scalar_one_or_none()
+    if not row:
+        return None
+
+    return {
+        "id": row.id,
+        "name": row.name,
+        "provider": row.provider,
+        "config": row.config,
+        "settings": repo_settings,
+        "task_id": task_id,
+        "repo_id": getattr(repo, "id", None),
+    }
+
+
+def _record_notification_log(
+    task_id: str | None,
+    notify_config_id: int | None,
+    event_type: str,
+    target: str | None,
+    status: str,
+    reason: str | None = None,
+    payload: dict | None = None,
+    error: str | None = None,
+):
+    import json as _json
+    import psycopg2
+
+    dsn = settings.DATABASE_PURE_URL
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notification_logs "
+                "(task_id, notify_config_id, event_type, target, status, reason, payload, error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)",
+                (
+                    task_id,
+                    notify_config_id,
+                    event_type,
+                    target,
+                    status,
+                    reason,
+                    _json.dumps(payload) if payload is not None else None,
+                    error,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _code_review_severity(data: dict) -> int:
+    findings = data.get("findings", []) or []
+    worst = 0
+    for finding in findings:
+        worst = max(worst, _SEVERITY_RANK.get(str(finding.get("severity", "")).lower(), 0))
+    if data.get("blocked"):
+        worst = max(worst, _SEVERITY_RANK["high"])
+    return worst
+
+
+def _notification_skip_reason(notif_data: dict, routing_settings: dict) -> str | None:
+    event_type = notif_data.get("type", "generic")
+    enabled_events = routing_settings.get("enabled_events")
+    if enabled_events is not None and event_type not in enabled_events:
+        return f"event disabled: {event_type}"
+
+    if event_type == "code_review_result":
+        data = notif_data.get("data", {}) or {}
+        if routing_settings.get("blocked_only") and not data.get("blocked"):
+            return "code review not blocked"
+
+        min_severity = str(routing_settings.get("min_severity", "all")).lower()
+        if min_severity != "all":
+            threshold = _SEVERITY_RANK.get(min_severity, 0)
+            if _code_review_severity(data) < threshold:
+                return f"severity below threshold: {min_severity}"
+
+    return None
+
+
 @celery_app.task(bind=True, name="ai_tasks.process_push_event", max_retries=2)
 def process_push_event(self, repo_id: int, event_data: dict):
     """Handle push event: run code review on the commit diff."""
@@ -94,11 +266,11 @@ def process_push_event(self, repo_id: int, event_data: dict):
     start_time = time.time()
 
     with SyncSession() as db:
-        # Mark running
+        # Mark analyzing (pipeline starting)
         db.execute(
             update(AITask)
             .where(AITask.task_id == task_id)
-            .values(status="running", updated_at=datetime.now(timezone.utc))
+            .values(status="analyzing", updated_at=datetime.now(timezone.utc))
         )
         db.commit()
 
@@ -116,32 +288,43 @@ def process_push_event(self, repo_id: int, event_data: dict):
         branch = event_data.get("branch", "")
         enabled_stages = get_stages_sync(repo_id, branch, db)
 
-        # Pre-load notify config synchronously — avoids asyncpg inside the async block
-        from app.models import NotifyConfig
-        notify_cfg_row = db.execute(
-            select(NotifyConfig).where(
-                NotifyConfig.is_default == True,
-                NotifyConfig.enabled == True,
+        # Pre-load notification route synchronously — avoids asyncpg inside the async block.
+        notify_cfg = _resolve_notify_config(db, repo, task_id)
+
+    def _sync_status_update(new_status: str):
+        with SyncSession() as sdb:
+            sdb.execute(
+                update(AITask)
+                .where(AITask.task_id == task_id)
+                .values(status=new_status, updated_at=datetime.now(timezone.utc))
             )
-        ).scalar_one_or_none()
-        notify_cfg = (
-            {"provider": notify_cfg_row.provider, "config": notify_cfg_row.config}
-            if notify_cfg_row else None
-        )
+            sdb.commit()
+
+    async def _async_status_callback(new_status: str):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _sync_status_update, new_status)
 
     try:
         # ── Async block: git + AI inference only, no DB ────────────────
-        output = _run_async(_ai_pipeline(repo, model, event_data, task_id, notify_cfg, enabled_stages))
+        output = _run_async(_ai_pipeline(
+            repo, model, event_data, task_id, notify_cfg, enabled_stages,
+            status_callback=_async_status_callback,
+        ))
         # ──────────────────────────────────────────────────────────────
 
         duration_ms = int((time.time() - start_time) * 1000)
+        output_data = output.get("output_data") or {}
+        pipeline_status = output_data.get("pipeline_status") or {}
+        final_status = "failed" if pipeline_status.get("status") in ("failed", "blocked") else "success"
+        error_message = pipeline_status.get("reason") if final_status == "failed" else None
         with SyncSession() as db:
             db.execute(
                 update(AITask)
                 .where(AITask.task_id == task_id)
                 .values(
-                    status="success",
-                    output_data=output.get("output_data"),
+                    status=final_status,
+                    error_message=error_message,
+                    output_data=output_data,
                     prompt_tokens=output.get("prompt_tokens", 0),
                     completion_tokens=output.get("completion_tokens", 0),
                     duration_ms=duration_ms,
@@ -149,7 +332,7 @@ def process_push_event(self, repo_id: int, event_data: dict):
                 )
             )
             db.commit()
-        logger.info("task.completed", task_id=task_id, duration_ms=duration_ms)
+        logger.info("task.completed", task_id=task_id, status=final_status, duration_ms=duration_ms)
 
     except Exception as exc:
         logger.exception("task.failed", task_id=task_id,
@@ -163,10 +346,9 @@ def process_push_event(self, repo_id: int, event_data: dict):
         raise self.retry(exc=exc, countdown=30)
 
 
-async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None) -> dict:
-    """Pure async: git diff + AI skills + notifications. No DB access."""
+async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None, status_callback=None) -> dict:
+    """Pure async: git diff + AI pipeline orchestration. No DB access."""
     from app.services.ai.engine import build_engine_from_db_model, AIEngine
-    from app.services.skills.registry import skill_registry
     from app.services.skills.base import SkillContext
     from app.services.git.agent import GitAgent
     from app.core.security import decrypt
@@ -182,17 +364,8 @@ async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: 
     # Fetch/clone repo
     git_agent.ensure_repo()
 
-    all_zeros = "0" * 40
-    if before_sha and before_sha != all_zeros and commit_sha and commit_sha != all_zeros:
-        diff, changed_files = git_agent.get_diff(before_sha, commit_sha)
-    elif commit_sha and commit_sha != all_zeros:
-        diff, changed_files = git_agent.get_commit_diff(commit_sha)
-    else:
-        # No valid SHA (e.g. test webhook) — diff HEAD against parent
-        try:
-            diff, changed_files = git_agent.get_latest_diff()
-        except Exception:
-            diff, changed_files = "", []
+    branch = event_data.get("branch", "")
+    diff, changed_files = _select_event_diff(git_agent, before_sha, commit_sha, branch)
 
     if not diff.strip():
         logger.info("task.no_diff", task_id=task_id)
@@ -209,62 +382,43 @@ async def _ai_pipeline(repo, model, event_data: dict, task_id: str, notify_cfg: 
         changed_files=changed_files,
     )
 
-    stages = set(enabled_stages or ["code_review"])
+    # Delegate to TestManagerAgent
+    from app.services.agents.test_manager import TestManagerAgent, PipelineContext
+    from app.services.ai.stage_router import build_stage_router_sync
+    from app.services.ai.agent_resolver import build_agent_resolver_sync
+
+    # Build agent resolver from repo.agent_bindings (new — Agent Management Module)
+    agent_resolver = None
+    agent_bindings = getattr(repo, "agent_bindings", None) or {}
+    if agent_bindings:
+        with SyncSession() as resolver_db:
+            agent_resolver = build_agent_resolver_sync(repo, engine, resolver_db)
+
+    # Build per-stage model router from repo config (legacy — Sprint A)
+    stage_router = None
     skills_config = repo.skills_config or {}
-    pt = ct = 0
-    output_data: dict = {}
-    loop = asyncio.get_event_loop()
+    if skills_config.get("stage_models"):
+        with SyncSession() as router_db:
+            stage_router = build_stage_router_sync(repo, engine, router_db)
 
-    async def _persist(key: str, val: dict):
-        output_data[key] = val
-        await loop.run_in_executor(None, _write_partial_output, task_id, key, val)
+    pipeline_ctx = PipelineContext(
+        repo=repo,
+        engine=engine,
+        git_agent=git_agent,
+        git_token=git_token,
+        skill_context=context,
+        event_data=event_data,
+        task_id=task_id,
+        enabled_stages=set(enabled_stages or ["code_review"]),
+        skills_config=skills_config,
+        notify_cfg=notify_cfg,
+        stage_router=stage_router,
+        agent_resolver=agent_resolver,
+        status_callback=status_callback,
+    )
 
-    # ── Code review ───────────────────────────────────────────────────────
-    if "code_review" not in stages:
-        logger.info("stage.skipped", stage="code_review")
-        await _persist("code_review", {"status": "skipped"})
-    else:
-        cr = await skill_registry.execute("code_review", context, engine)
-        pt += cr.prompt_tokens; ct += cr.completion_tokens
-        await _persist("code_review", cr.details)
-        for notif in cr.notifications:
-            await _send_notification(notif, notify_cfg)
-
-    # ── Test generation ───────────────────────────────────────────────────
-    if "test_generation" not in stages:
-        logger.info("stage.skipped", stage="test_generation")
-        await _persist("test_generation", {"status": "skipped"})
-    else:
-        test_cfg = skills_config.get("test_generation", {})
-        tg = await skill_registry.execute(
-            "test_generation", context, engine,
-            skill_config={k: v for k, v in test_cfg.items() if k != "enabled"},
-        )
-        pt += tg.prompt_tokens; ct += tg.completion_tokens
-        tg_details = dict(tg.details)
-        files = tg_details.get("generated_files", [])
-        # SECURITY: never execute the LLM-provided run_command. Derive a fixed,
-        # whitelisted argv from the detected framework instead (avoids shell injection
-        # via a prompt-injected diff). Frameworks we can't safely run are skipped.
-        cmd = _safe_test_command(tg_details.get("framework"))
-
-        if files and cmd:
-            wr = await _run_worktree_tests(git_agent, context.branch or commit_sha, files, cmd)
-        elif files and not cmd:
-            wr = {"status": "skipped",
-                  "reason": f"framework '{tg_details.get('framework')}' not runnable in sandbox"}
-        else:
-            wr = {"status": "skipped", "reason": "no files generated"}
-
-        tg_details["worktree_run"] = wr
-        await _persist("test_generation", tg_details)
-        for notif in tg.notifications:
-            await _send_notification(
-                {**notif, "data": {**notif.get("data", {}), "worktree_run": wr}},
-                notify_cfg,
-            )
-
-    return {"output_data": output_data, "prompt_tokens": pt, "completion_tokens": ct}
+    manager = TestManagerAgent()
+    return await manager.run(pipeline_ctx)
 
 
 async def _run_worktree_tests(
@@ -304,12 +458,28 @@ async def _run_worktree_tests(
             exit_code=result["exit_code"],
             success=result["success"],
         )
+
+        # Read real coverage BEFORE cleanup wipes the worktree directory.
+        coverage = worktree.read_coverage(COVERAGE_XML_NAME)
+        measured = coverage.get("line_rate")
+        logger.info(
+            "worktree.coverage",
+            measured=measured,
+            lines_covered=coverage.get("lines_covered"),
+            lines_valid=coverage.get("lines_valid"),
+        )
+
         return {
             "status": "passed" if result["success"] else "failed",
             "exit_code": result["exit_code"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
             "run_command": cmd_display,
+            "coverage": coverage,
+            # Convenience field for MR comments / notifications. Kept separate
+            # from the legacy LLM-sourced `estimated_coverage_delta` so downstream
+            # consumers can prefer the measured number when present.
+            "measured_coverage_delta": f"+{measured:.2f}%" if measured is not None else None,
         }
     except Exception as exc:
         logger.warning("worktree.pytest_error", error=str(exc))
@@ -320,6 +490,101 @@ async def _run_worktree_tests(
                 worktree.cleanup()
             except Exception:
                 pass
+
+
+async def _validate_repair_loop(
+    git_agent,
+    engine,
+    branch_or_sha: str,
+    generated_files: list[dict],
+    run_command: list[str],
+    task_id: str,
+    loop,
+    context_hint: str = "",
+    repair_enabled: bool = True,
+    timeout: int = 60,
+    status_callback=None,
+    max_rounds_override: int = None,
+) -> tuple[dict, list[dict]]:
+    """
+    Run tests → validate → repair → retry loop.
+    When repair_enabled=False, only runs validation once (no repair attempts).
+    Returns (final worktree_result_dict, repair_history list).
+    """
+    from app.services.agents.validator_agent import ValidatorAgent
+    from app.services.agents.repair_agent import RepairAgent
+
+    validator = ValidatorAgent()
+    repair_agent = RepairAgent()
+    max_rounds = max_rounds_override if max_rounds_override else (settings.MAX_REPAIR_ROUNDS if repair_enabled else 1)
+    current_files = list(generated_files)
+    repair_history: list[dict] = []
+
+    for round_num in range(1, max_rounds + 1):
+        # Run tests in WorkTree
+        run_start = time.time()
+        wr = await _run_worktree_tests(git_agent, branch_or_sha, current_files, run_command, timeout)
+        run_ms = int((time.time() - run_start) * 1000)
+
+        # Validate
+        vr = validator.parse_worktree_result(wr, duration_ms=run_ms)
+
+        await loop.run_in_executor(None, _record_agent_execution,
+            task_id, "validator", vr.status,
+            {"round": round_num}, vr.to_dict(),
+            0, 0, run_ms, round_num)
+
+        if vr.status == "all_pass":
+            wr["repair_rounds"] = round_num - 1
+            return wr, repair_history
+
+        if not vr.can_repair or round_num == max_rounds:
+            wr["repair_rounds"] = round_num - 1
+            wr["final_validation"] = vr.to_dict()
+            return wr, repair_history
+
+        # Repair — emit REPAIRING status
+        if status_callback:
+            try:
+                await status_callback("repairing")
+            except Exception:
+                pass
+
+        repair_start = time.time()
+        rr = await repair_agent.repair(
+            engine, vr, current_files, round_number=round_num, context_hint=context_hint,
+        )
+        repair_ms = int((time.time() - repair_start) * 1000)
+
+        await loop.run_in_executor(None, _record_agent_execution,
+            task_id, "repair",
+            "success" if rr.success else "failed",
+            {"round": round_num, "failures_count": len(vr.failures)},
+            rr.to_dict(),
+            rr.prompt_tokens, rr.completion_tokens, repair_ms, round_num)
+
+        if not rr.success or not rr.repaired_files:
+            wr["repair_rounds"] = round_num
+            wr["final_validation"] = vr.to_dict()
+            return wr, repair_history
+
+        # Apply repairs to current_files for next round
+        repair_map = {rf["path"]: rf["content"] for rf in rr.repaired_files}
+        current_files = [
+            {"path": f["path"], "content": repair_map.get(f["path"], f["content"])}
+            for f in current_files
+        ]
+
+        repair_history.append({
+            "round": round_num,
+            "fixes": [a.fix_description for a in rr.actions],
+            "summary": rr.summary,
+        })
+
+        logger.info("repair.round_complete", round=round_num, task_id=task_id)
+
+    # Should not reach here, but safety fallback
+    return wr, repair_history
 
 
 def _notification_color(notif_data: dict) -> str:
@@ -334,6 +599,13 @@ def _notification_color(notif_data: dict) -> str:
             return "red"
         if status not in ("passed", None):
             return "yellow"
+    if ntype == "quality_score_result":
+        score = data.get("total_score")
+        risk = data.get("risk_level")
+        if risk == "high" or (score is not None and score < 6):
+            return "red"
+        if risk == "medium" or (score is not None and score < 8):
+            return "yellow"
     return "green"
 
 
@@ -343,15 +615,42 @@ async def _send_notification(notif_data: dict, notify_cfg: dict | None):
         return
     from app.services.notify.feishu import build_notify_provider
     from app.services.notify.base import NotifyMessage
+    event_type = notif_data.get("type", "generic")
+    task_id = notify_cfg.get("task_id")
+    notify_config_id = notify_cfg.get("id")
+    target = notify_cfg.get("name") or notify_cfg.get("provider")
+    skip_reason = _notification_skip_reason(notif_data, notify_cfg.get("settings") or {})
+    if skip_reason:
+        try:
+            _record_notification_log(
+                task_id, notify_config_id, event_type, target,
+                "skipped", reason=skip_reason, payload=notif_data,
+            )
+        except Exception as exc:
+            logger.warning("notification.log_failed", error=str(exc))
+        return
+
     try:
         provider = build_notify_provider(notify_cfg)
         msg = NotifyMessage(
             title=notif_data.get("type", "AI DevOps 通知"),
             content="",
-            message_type=notif_data.get("type", "generic"),
+            message_type=event_type,
             data=notif_data,
             color=_notification_color(notif_data),
         )
-        await provider.send(msg)
+        ok = await provider.send(msg)
+        _record_notification_log(
+            task_id, notify_config_id, event_type, target,
+            "sent" if ok else "failed", payload=notif_data,
+            error=None if ok else "provider returned false",
+        )
     except Exception as e:
         logger.warning("notification.failed", error=str(e))
+        try:
+            _record_notification_log(
+                task_id, notify_config_id, event_type, target,
+                "failed", payload=notif_data, error=str(e),
+            )
+        except Exception as log_exc:
+            logger.warning("notification.log_failed", error=str(log_exc))
