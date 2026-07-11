@@ -202,7 +202,9 @@ export default function AgentsPage() {
           <Form.Item name="description" label="描述">
             <Input placeholder="Agent 用途说明" />
           </Form.Item>
-          <Form.Item name="stage_type" label="阶段类型" rules={[{ required: true }]}>
+          <Form.Item name="stage_type" label="阶段类型" rules={[{ required: true }]}
+            extra={editing?.is_system ? '系统 Agent 的阶段类型不可修改' : undefined}
+          >
             <Select
               placeholder="选择流水线阶段"
               options={stages.map((s: any) => ({ value: s.value, label: s.label }))}

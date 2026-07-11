@@ -247,6 +247,14 @@ class TestManagerAgent:
                 return ctx.agent_resolver.get_policy_config(stage_type)
         return {}
 
+    async def _skill_name_for(self, ctx: PipelineContext, stage_type: str, default_name: str) -> str:
+        """Resolve skill name for a stage from AgentResolver, with hardcoded fallback."""
+        if ctx.agent_resolver:
+            name = ctx.agent_resolver.get_skill_name(stage_type)
+            if name:
+                return name
+        return default_name
+
     async def _emit_status(self, ctx: PipelineContext, stage_name: str):
         """Emit task status update via callback if available."""
         new_status = STAGE_STATUS_MAP.get(stage_name)
@@ -266,7 +274,8 @@ class TestManagerAgent:
         from app.services.skills.registry import skill_registry
         engine = self._engine_for(ctx, "code_review")
         skill_cfg = self._skill_config_for(ctx, "code_review")
-        cr = await skill_registry.execute("code_review", ctx.skill_context, engine, skill_config=skill_cfg)
+        skill_name = await self._skill_name_for(ctx, "code_review", "code_review")
+        cr = await skill_registry.execute(skill_name, ctx.skill_context, engine, skill_config=skill_cfg)
         status = "success"
         cr_details = dict(cr.details)
         if not cr.success:
@@ -300,7 +309,8 @@ class TestManagerAgent:
         start = time.time()
         engine = self._engine_for(ctx, "change_intelligence")
         ci_skill_cfg = self._skill_config_for(ctx, "change_intelligence")
-        ci_result = await skill_registry.execute("change_intelligence", ctx.skill_context, engine, skill_config=ci_skill_cfg)
+        skill_name = await self._skill_name_for(ctx, "change_intelligence", "change_intelligence")
+        ci_result = await skill_registry.execute(skill_name, ctx.skill_context, engine, skill_config=ci_skill_cfg)
         ms = int((time.time() - start) * 1000)
 
         ci_data = ci_result.details
@@ -389,8 +399,9 @@ class TestManagerAgent:
         engine = self._engine_for(ctx, "generator")
 
         start = time.time()
+        skill_name = await self._skill_name_for(ctx, "generator", "test_generation")
         tg = await skill_registry.execute(
-            "test_generation", ctx.skill_context, engine,
+            skill_name, ctx.skill_context, engine,
             skill_config=merged_cfg,
         )
         ms = int((time.time() - start) * 1000)

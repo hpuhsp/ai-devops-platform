@@ -283,6 +283,15 @@ export default function RulesPage() {
         title={`流水线分支规则（共 ${rules.length} 条，按优先级降序匹配首条）`}
         extra={<Button type="primary" icon={<PlusOutlined />} onClick={openAdd}>新增规则</Button>}
       >
+        <div style={{
+          background: '#f0f5ff', border: '1px solid #d6e4ff',
+          borderRadius: 6, padding: '10px 14px', marginBottom: 14,
+          fontSize: 12, color: '#666', lineHeight: 1.7,
+        }}>
+          流水线规则是控制<strong>各分支执行哪些阶段</strong>的唯一入口。下方勾选的阶段对应后端
+          <strong>Agent</strong> 自动执行——你不需要手动绑定 Agent，只需在规则中按需勾选。
+          「单元测试」在内部会自动展开为变更分析、上下文构建、测试生成、验证修复和质量评分等多个 Agent 链路。
+        </div>
         <Table
           dataSource={rules}
           columns={columns}
