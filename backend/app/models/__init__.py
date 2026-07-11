@@ -8,6 +8,7 @@ from .pipeline_rule import PipelineRule
 from .agent_execution import AgentExecution
 from .agent import Agent
 from .notification_log import NotificationLog
+from .notification_policy import NotificationPolicy
 from .task_status import TaskStatus, LEGACY_STATUS_MAP, STAGE_STATUS_MAP
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "AgentExecution",
     "Agent",
     "NotificationLog",
+    "NotificationPolicy",
     "TaskStatus",
     "LEGACY_STATUS_MAP",
     "STAGE_STATUS_MAP",

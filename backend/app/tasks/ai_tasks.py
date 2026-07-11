@@ -602,10 +602,77 @@ def _notification_color(notif_data: dict) -> str:
     return "green"
 
 
-async def _send_notification(notif_data: dict, notify_cfg: dict | None):
-    """Send notification. notify_cfg is pre-loaded synchronously by the Celery task."""
+async def _send_notification(notif_data: dict, notify_cfg: dict | None,
+                             repo_id: int = None, branch: str = "", stage_type: str = ""):
+    """Send notification — policy-aware with repo config fallback."""
     if not notify_cfg:
         return
+    await _send_notifications_policy_aware(
+        notif_data, notify_cfg, repo_id=repo_id, branch=branch, stage_type=stage_type
+    )
+
+
+async def _send_notifications_policy_aware(
+    notif_data: dict,
+    notify_cfg: dict | None,
+    repo_id: int | None = None,
+    branch: str = "",
+    stage_type: str = "",
+):
+    """Send notification via policy engine first, fall back to repo config."""
+    from app.services.notify.policy_engine import resolve_policies_sync
+
+    # Try policy engine first
+    event_type = notif_data.get("type", "generic")
+    data = notif_data.get("data", {}) or {}
+    status = data.get("status", "")
+    severity = _code_review_severity(data) if event_type == "code_review_result" else "low"
+    severity_str = {0: "low", 1: "low", 2: "medium", 3: "high", 4: "critical"}.get(severity, "low")
+
+    with SyncSession() as pdb:
+        policies = resolve_policies_sync(
+            pdb,
+            repo_id=repo_id,
+            branch=branch,
+            event_type=event_type,
+            stage_type=stage_type,
+            status=status,
+            severity=severity_str,
+            blocked=data.get("blocked", False),
+        )
+
+    if policies:
+        for policy in policies:
+            if policy.notify_config_id:
+                # Build a notify_cfg from the policy's channel
+                with SyncSession() as pdb:
+                    from app.models import NotifyConfig
+                    nc = pdb.execute(
+                        select(NotifyConfig).where(NotifyConfig.id == policy.notify_config_id)
+                    ).scalar_one_or_none()
+                if nc:
+                    policy_notify_cfg = {
+                        "id": nc.id,
+                        "name": nc.name,
+                        "provider": nc.provider,
+                        "config": nc.config,
+                        "settings": {
+                            "enabled_events": None,  # policy already filters
+                            "min_severity": "all",
+                            "blocked_only": False,
+                        },
+                        "task_id": notify_cfg.get("task_id") if notify_cfg else None,
+                        "repo_id": repo_id,
+                    }
+                    await _send_one(notif_data, policy_notify_cfg)
+        return
+
+    # Fall back to old repo-level config
+    if notify_cfg:
+        await _send_one(notif_data, notify_cfg)
+
+
+async def _send_one(notif_data: dict, notify_cfg: dict):
     from app.services.notify.feishu import build_notify_provider
     from app.services.notify.base import NotifyMessage
     event_type = notif_data.get("type", "generic")

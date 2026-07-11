@@ -16,6 +16,7 @@ const menuItems = [
       { key: '/config/agents', icon: <RobotOutlined />, label: 'Agent 管理' },
       { key: '/config/repositories', icon: <BranchesOutlined />, label: '代码仓库' },
       { key: '/config/notify', icon: <BellOutlined />, label: '通知配置' },
+      { key: '/config/notify-policies', icon: <BellOutlined />, label: '通知策略' },
       { key: '/config/rules', icon: <ApartmentOutlined />, label: '流水线规则' },
     ],
   },
