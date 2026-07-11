@@ -8,13 +8,44 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from app.core.config import settings
 from app.services.skills.base import SkillBase, SkillContext, SkillResult
-import structlog
+try:
+    import structlog
+except ModuleNotFoundError:
+    import logging
+
+    class _KeywordLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def info(self, event: str, **kwargs):
+            self._logger.info("%s %s", event, kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._logger.warning("%s %s", event, kwargs)
+
+        def exception(self, event: str, **kwargs):
+            self._logger.exception("%s %s", event, kwargs)
+
+    class _StructlogFallback:
+        @staticmethod
+        def get_logger():
+            return _KeywordLogger(__name__)
+
+    structlog = _StructlogFallback()
 
 logger = structlog.get_logger()
 
-SKIP_EXTENSIONS = set(settings.CHANGE_INTEL_SKIP_EXTENSIONS)
+DEFAULT_SKIP_EXTENSIONS = [
+    ".md", ".txt", ".rst", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".json",
+]
+
+try:
+    from app.core.config import settings
+
+    SKIP_EXTENSIONS = set(settings.CHANGE_INTEL_SKIP_EXTENSIONS)
+except ModuleNotFoundError:
+    SKIP_EXTENSIONS = set(DEFAULT_SKIP_EXTENSIONS)
 
 SYSTEM_PROMPT = """你是一位代码变更影响分析专家。请根据以下信息判断是否需要为本次变更生成单元测试。
 

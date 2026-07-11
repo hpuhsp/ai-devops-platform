@@ -385,8 +385,8 @@ async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, not
         changed_files=changed_files,
     )
 
-    # Delegate to TestManagerAgent
-    from app.services.agents.test_manager import TestManagerAgent, PipelineContext
+    # Delegate to the reusable unit test workflow engine
+    from app.services.unit_test_engine import UnitTestWorkflow, PipelineContext
     from app.services.ai.agent_resolver import build_agent_resolver_sync
 
     # Always build AgentResolver — system built-in agents serve as defaults
@@ -410,7 +410,7 @@ async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, not
         status_callback=status_callback,
     )
 
-    manager = TestManagerAgent()
+    manager = UnitTestWorkflow()
     return await manager.run(pipeline_ctx)
 
 
@@ -602,11 +602,44 @@ def _notification_color(notif_data: dict) -> str:
     return "green"
 
 
+def _notification_event_attributes(notif_data: dict) -> dict:
+    """Derive policy-matching attributes from a normalized notification event."""
+    event_type = notif_data.get("type", "generic")
+    data = notif_data.get("data", {}) or {}
+    status = str(data.get("status") or "")
+    severity = "low"
+    blocked = bool(data.get("blocked", False))
+
+    if event_type == "code_review_result":
+        severity_rank = _code_review_severity(data)
+        severity = {0: "low", 1: "low", 2: "medium", 3: "high", 4: "critical"}.get(
+            severity_rank, "low"
+        )
+        status = "blocked" if blocked else (status or "success")
+    elif event_type == "test_generation_result":
+        worktree_status = (data.get("worktree_run") or {}).get("status")
+        if worktree_status:
+            status = "success" if worktree_status == "passed" else str(worktree_status)
+    elif event_type == "quality_score_result":
+        quality = notif_data.get("quality_score") or data.get("quality_score") or {}
+        risk_level = str(quality.get("risk_level") or "").lower()
+        if risk_level in {"low", "medium", "high", "critical"}:
+            severity = risk_level
+        total_score = quality.get("total_score")
+        if not status:
+            status = "failed" if risk_level == "high" or (total_score is not None and total_score < 6) else "success"
+
+    return {
+        "event_type": event_type,
+        "status": status,
+        "severity": severity,
+        "blocked": blocked,
+    }
+
+
 async def _send_notification(notif_data: dict, notify_cfg: dict | None,
                              repo_id: int = None, branch: str = "", stage_type: str = ""):
     """Send notification — policy-aware with repo config fallback."""
-    if not notify_cfg:
-        return
     await _send_notifications_policy_aware(
         notif_data, notify_cfg, repo_id=repo_id, branch=branch, stage_type=stage_type
     )
@@ -623,24 +656,21 @@ async def _send_notifications_policy_aware(
     from app.services.notify.policy_engine import resolve_policies_sync
 
     # Try policy engine first
-    event_type = notif_data.get("type", "generic")
-    data = notif_data.get("data", {}) or {}
-    status = data.get("status", "")
-    severity = _code_review_severity(data) if event_type == "code_review_result" else "low"
-    severity_str = {0: "low", 1: "low", 2: "medium", 3: "high", 4: "critical"}.get(severity, "low")
+    attrs = _notification_event_attributes(notif_data)
 
     with SyncSession() as pdb:
         policies = resolve_policies_sync(
             pdb,
             repo_id=repo_id,
             branch=branch,
-            event_type=event_type,
+            event_type=attrs["event_type"],
             stage_type=stage_type,
-            status=status,
-            severity=severity_str,
-            blocked=data.get("blocked", False),
+            status=attrs["status"],
+            severity=attrs["severity"],
+            blocked=attrs["blocked"],
         )
 
+    sent_via_policy = False
     if policies:
         for policy in policies:
             if policy.notify_config_id:
@@ -650,26 +680,59 @@ async def _send_notifications_policy_aware(
                     nc = pdb.execute(
                         select(NotifyConfig).where(NotifyConfig.id == policy.notify_config_id)
                     ).scalar_one_or_none()
-                if nc:
-                    policy_notify_cfg = {
-                        "id": nc.id,
-                        "name": nc.name,
-                        "provider": nc.provider,
-                        "config": nc.config,
-                        "settings": {
-                            "enabled_events": None,  # policy already filters
-                            "min_severity": "all",
-                            "blocked_only": False,
-                        },
-                        "task_id": notify_cfg.get("task_id") if notify_cfg else None,
-                        "repo_id": repo_id,
-                    }
-                    await _send_one(notif_data, policy_notify_cfg)
-        return
+                if nc and nc.enabled:
+                    sent_via_policy = True
+                    targets = policy.targets or []
+                    if not targets:
+                        targets = [{"type": "notify_config", "id": nc.id, "name": nc.name}]
+                    for target_info in targets:
+                        policy_notify_cfg = _policy_notify_cfg(
+                            nc,
+                            policy,
+                            target_info,
+                            notify_cfg.get("task_id") if notify_cfg else None,
+                            repo_id,
+                        )
+                        await _send_one(notif_data, policy_notify_cfg)
+        if sent_via_policy:
+            return
 
     # Fall back to old repo-level config
     if notify_cfg:
         await _send_one(notif_data, notify_cfg)
+
+
+def _policy_notify_cfg(notify_config, policy, target_info: dict, task_id: str | None, repo_id: int | None) -> dict:
+    """Build a notify config for one policy target.
+
+    For webhook-style targets, a policy may override the channel webhook_url via:
+    {"type": "webhook", "name": "QA group", "webhook_url": "...", "sign_key": "..."}
+    If no override is provided, the selected notify_config is used as-is.
+    """
+    cfg = dict(notify_config.config or {})
+    target_type = str(target_info.get("type") or "notify_config")
+    target_name = target_info.get("name") or target_info.get("id") or notify_config.name
+
+    webhook_url = target_info.get("webhook_url")
+    if webhook_url:
+        cfg["webhook_url"] = webhook_url
+    if target_info.get("sign_key"):
+        cfg["sign_key"] = target_info.get("sign_key")
+
+    return {
+        "id": notify_config.id,
+        "name": notify_config.name,
+        "provider": notify_config.provider,
+        "config": cfg,
+        "settings": {
+            "enabled_events": None,  # policy already filters
+            "min_severity": "all",
+            "blocked_only": False,
+        },
+        "task_id": task_id,
+        "repo_id": repo_id,
+        "target_label": f"{policy.name}:{target_type}:{target_name}",
+    }
 
 
 async def _send_one(notif_data: dict, notify_cfg: dict):
@@ -678,7 +741,7 @@ async def _send_one(notif_data: dict, notify_cfg: dict):
     event_type = notif_data.get("type", "generic")
     task_id = notify_cfg.get("task_id")
     notify_config_id = notify_cfg.get("id")
-    target = notify_cfg.get("name") or notify_cfg.get("provider")
+    target = notify_cfg.get("target_label") or notify_cfg.get("name") or notify_cfg.get("provider")
     skip_reason = _notification_skip_reason(notif_data, notify_cfg.get("settings") or {})
     if skip_reason:
         try:

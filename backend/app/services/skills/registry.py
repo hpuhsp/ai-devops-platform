@@ -3,11 +3,45 @@ Skill Registry — register, load, and execute skills.
 Supports built-in skills and project-level .ai-skills.yml overrides.
 """
 import importlib
-import yaml
 import os
 from pathlib import Path
 from typing import Type
-import structlog
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
+
+try:
+    import structlog
+except ModuleNotFoundError:
+    import logging
+
+    class _KeywordLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def debug(self, event: str, **kwargs):
+            self._logger.debug("%s %s", event, kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._logger.info("%s %s", event, kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._logger.warning("%s %s", event, kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._logger.error("%s %s", event, kwargs)
+
+        def exception(self, event: str, **kwargs):
+            self._logger.exception("%s %s", event, kwargs)
+
+    class _StructlogFallback:
+        @staticmethod
+        def get_logger():
+            return _KeywordLogger(__name__)
+
+    structlog = _StructlogFallback()
 
 from .base import SkillBase, SkillContext, SkillResult
 
@@ -77,7 +111,7 @@ class SkillRegistry:
 
     def load_project_config(self, config_path: str) -> dict:
         """Load .ai-skills.yml from project root (if present)."""
-        if not os.path.exists(config_path):
+        if not os.path.exists(config_path) or yaml is None:
             return {}
         with open(config_path) as f:
             return yaml.safe_load(f) or {}

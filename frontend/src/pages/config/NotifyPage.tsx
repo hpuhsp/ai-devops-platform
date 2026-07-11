@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Form, Input, Select, Space, Popconfirm, message, Tag, Switch } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
-import { listNotify, createNotify, deleteNotify, setDefaultNotify } from '../../services/api'
+import { Table, Button, Modal, Form, Input, Select, Space, Popconfirm, message, Tag, Switch, Typography } from 'antd'
+import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
+import { listNotify, createNotify, deleteNotify, setDefaultNotify, listNotifyLogs } from '../../services/api'
+
+const { Text } = Typography
 
 export default function NotifyPage() {
   const [items, setItems] = useState<any[]>([])
@@ -9,9 +11,11 @@ export default function NotifyPage() {
   const [form] = Form.useForm()
   const [provider, setProvider] = useState('feishu_webhook')
   const [loading, setLoading] = useState(false)
+  const [logs, setLogs] = useState<any[]>([])
 
   const load = () => listNotify().then(setItems).catch(console.error)
-  useEffect(() => { load() }, [])
+  const loadLogs = () => listNotifyLogs({ limit: 80 }).then(setLogs).catch(console.error)
+  useEffect(() => { load(); loadLogs() }, [])
 
   const handleSubmit = async () => {
     const { name, provider: p, is_default, enabled, ...rest } = await form.validateFields()
@@ -21,7 +25,7 @@ export default function NotifyPage() {
       message.success('创建成功')
       setOpen(false)
       form.resetFields()
-      load()
+      load(); loadLogs()
     } catch {
       message.error('操作失败')
     } finally {
@@ -33,7 +37,7 @@ export default function NotifyPage() {
     try {
       await setDefaultNotify(id)
       message.success('设置默认成功')
-      load()
+      load(); loadLogs()
     } catch {
       message.error('设置默认失败')
     }
@@ -43,7 +47,7 @@ export default function NotifyPage() {
     try {
       await deleteNotify(id)
       message.success('删除成功')
-      load()
+      load(); loadLogs()
     } catch {
       message.error('删除失败')
     }
@@ -69,6 +73,41 @@ export default function NotifyPage() {
     },
   ]
 
+  const logColumns = [
+    {
+      title: '时间',
+      dataIndex: 'created_at',
+      width: 150,
+      render: (v: string) => v ? new Date(v).toLocaleString() : '-',
+    },
+    { title: '任务', dataIndex: 'task_id', width: 180, render: (v: string) => v || '-' },
+    { title: '事件', dataIndex: 'event_type', width: 140, render: (v: string) => <Tag>{v}</Tag> },
+    {
+      title: '目标',
+      dataIndex: 'target',
+      width: 180,
+      render: (v: string) => <Text style={{ fontSize: 12 }}>{v || '-'}</Text>,
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 90,
+      render: (v: string) => {
+        const color = v === 'sent' ? 'green' : v === 'failed' ? 'red' : 'orange'
+        const label = v === 'sent' ? '已发送' : v === 'failed' ? '失败' : '已跳过'
+        return <Tag color={color}>{label}</Tag>
+      },
+    },
+    {
+      title: '原因 / 错误',
+      render: (_: any, r: any) => (
+        <Text type={r.error ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>
+          {r.error || r.reason || '-'}
+        </Text>
+      ),
+    },
+  ]
+
   return (
     <div style={{ background: '#fff', padding: 24, borderRadius: 8 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
@@ -78,6 +117,19 @@ export default function NotifyPage() {
         </Button>
       </div>
       <Table dataSource={items} columns={columns} rowKey="id" size="small" />
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', margin: '24px 0 12px' }}>
+        <span style={{ fontSize: 16, fontWeight: 600 }}>通知日志</span>
+        <Button size="small" icon={<ReloadOutlined />} onClick={loadLogs}>刷新</Button>
+      </div>
+      <Table
+        dataSource={logs}
+        columns={logColumns}
+        rowKey="id"
+        size="small"
+        pagination={{ pageSize: 10 }}
+        scroll={{ x: 900 }}
+      />
 
       <Modal title="添加通知配置" open={open} onOk={handleSubmit} onCancel={() => setOpen(false)} confirmLoading={loading}>
         <Form form={form} layout="vertical" initialValues={{ provider: 'feishu_webhook', is_default: false, enabled: true }}>

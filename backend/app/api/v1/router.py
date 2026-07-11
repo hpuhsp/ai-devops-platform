@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from .endpoints import webhook, config, tasks, stats, rules, agents, notification_policies
+from .endpoints import webhook, config, tasks, stats, rules, agents, notification_policies, unit_test
 
 api_router = APIRouter()
 
@@ -10,3 +10,4 @@ api_router.include_router(stats.router,                    prefix="/api/v1/stats
 api_router.include_router(rules.router,                    prefix="/api/v1/rules",                   tags=["rules"])
 api_router.include_router(agents.router,                   prefix="/api/v1/agents",                  tags=["agents"])
 api_router.include_router(notification_policies.router,    prefix="/api/v1",                         tags=["notification-policies"])
+api_router.include_router(unit_test.router,                prefix="/api/v1/unit-test",               tags=["unit-test"])

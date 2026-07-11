@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
   Table, Button, Modal, Form, Input, Select, Switch, Space,
-  Popconfirm, message, Tag, InputNumber, Divider, Typography,
+  Popconfirm, message, Tag, Divider, Typography, Tooltip,
 } from 'antd'
-import { PlusOutlined, CopyOutlined } from '@ant-design/icons'
+import { PlusOutlined, CopyOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import {
   listAgents, createAgent, updateAgent, deleteAgent, cloneAgent,
-  listAgentSkills, listAgentStages, listModels,
+  listAgentSkills, listAgentStages, listModels, listAgentMcpTools, validateAgent,
 } from '../../services/api'
 
 const { TextArea } = Input
@@ -25,24 +25,28 @@ export default function AgentsPage() {
   const [models, setModels] = useState<any[]>([])
   const [skills, setSkills] = useState<any[]>([])
   const [stages, setStages] = useState<any[]>([])
+  const [mcpTools, setMcpTools] = useState<any[]>([])
   const [stageFilter, setStageFilter] = useState<string | undefined>(undefined)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<any>(null)
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
+  const selectedStage = Form.useWatch('stage_type', form)
 
   const load = async () => {
     try {
-      const [agentData, modelData, skillData, stageData] = await Promise.all([
+      const [agentData, modelData, skillData, stageData, mcpData] = await Promise.all([
         listAgents(stageFilter ? { stage_type: stageFilter } : undefined),
         listModels(),
         listAgentSkills(),
         listAgentStages(),
+        listAgentMcpTools(),
       ])
       setAgents(agentData)
       setModels(modelData)
       setSkills(skillData)
       setStages(stageData)
+      setMcpTools(mcpData)
     } catch (e) {
       console.error(e)
     }
@@ -64,18 +68,35 @@ export default function AgentsPage() {
   const handleSubmit = async () => {
     const values = await form.validateFields()
 
-    // Parse JSON config fields
-    const parseJson = (v: string | object | undefined, fallback: object = {}) => {
+    const parseJson = (label: string, v: string | object | undefined, fallback: object | any[] = {}) => {
       if (!v || (typeof v === 'string' && !v.trim())) return fallback
       if (typeof v === 'object') return v
-      try { return JSON.parse(v) } catch { return fallback }
+      try { return JSON.parse(v) } catch { throw new Error(`${label} JSON 格式不正确`) }
     }
 
-    const payload = {
-      ...values,
-      skill_config: parseJson(values.skill_config),
-      model_config: parseJson(values.model_config),
-      policy_config: parseJson(values.policy_config),
+    let payload: any
+    try {
+      payload = {
+        ...values,
+        model_id: values.model_id ?? null,
+        skills: parseJson('Skills', values.skills, []),
+        mcp_tools: parseJson('MCP Tools', values.mcp_tools, []),
+        guardrails: parseJson('Guardrails', values.guardrails, {}),
+        skill_config: parseJson('Skill Config', values.skill_config),
+        model_config: parseJson('Model Config', values.model_config),
+        policy_config: parseJson('Policy Config', values.policy_config),
+      }
+    } catch (e: any) {
+      message.error(e.message || 'JSON 配置格式不正确')
+      return
+    }
+    if ((!payload.skills || payload.skills.length === 0) && payload.skill_name) {
+      payload.skills = [{ name: payload.skill_name, version: '1.0.0', config: {} }]
+    }
+    if (editing?.is_system) {
+      payload.stage_type = editing.stage_type
+      payload.skill_name = editing.skill_name
+      payload.skills = editing.skills || [{ name: editing.skill_name, version: '1.0.0', config: {} }]
     }
 
     setLoading(true)
@@ -108,6 +129,19 @@ export default function AgentsPage() {
     }
   }
 
+  const handleValidate = async (id: number) => {
+    try {
+      const result = await validateAgent(id)
+      if (result.valid) {
+        message.success(result.warnings?.length ? `验证通过，${result.warnings.length} 条提醒` : '验证通过')
+      } else {
+        message.error(result.errors?.join('；') || '验证失败')
+      }
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '验证失败')
+    }
+  }
+
   const columns = [
     {
       title: '名称', dataIndex: 'name', width: 180,
@@ -122,7 +156,17 @@ export default function AgentsPage() {
       title: '阶段类型', dataIndex: 'stage_type', width: 120,
       render: (v: string) => <Tag color="cyan">{STAGE_LABELS[v] || v}</Tag>,
     },
-    { title: 'Skill', dataIndex: 'skill_name', width: 150 },
+    {
+      title: 'Skill', dataIndex: 'skills', width: 180,
+      render: (_: any, r: any) => (
+        <Space size={4} wrap>
+          {((r.skills?.length ? r.skills : [{ name: r.skill_name }]) || []).slice(0, 2).map((s: any) => (
+            <Tag key={s.name || r.skill_name}>{s.name || r.skill_name}</Tag>
+          ))}
+          {r.skills?.length > 2 && <Tag>+{r.skills.length - 2}</Tag>}
+        </Space>
+      ),
+    },
     {
       title: '绑定模型', dataIndex: 'model_id', width: 120,
       render: (v: number) => (
@@ -135,19 +179,25 @@ export default function AgentsPage() {
     },
     { title: '描述', dataIndex: 'description', ellipsis: true },
     {
-      title: '操作', width: 200,
+      title: '操作', width: 240,
       render: (_: any, record: any) => (
         <Space>
           <Button size="small" onClick={() => {
             setEditing(record)
             form.setFieldsValue({
               ...record,
+              skills: JSON.stringify(record.skills || [{ name: record.skill_name, version: '1.0.0', config: {} }], null, 2),
+              mcp_tools: JSON.stringify(record.mcp_tools || [], null, 2),
+              guardrails: JSON.stringify(record.guardrails || {}, null, 2),
               skill_config: JSON.stringify(record.skill_config || {}, null, 2),
               model_config: JSON.stringify(record.model_config || {}, null, 2),
               policy_config: JSON.stringify(record.policy_config || {}, null, 2),
             })
             setOpen(true)
           }}>编辑</Button>
+          <Tooltip title="验证 Agent 配置">
+            <Button size="small" icon={<SafetyCertificateOutlined />} onClick={() => handleValidate(record.id)} />
+          </Tooltip>
           <Button size="small" icon={<CopyOutlined />} onClick={() => handleClone(record.id)}>
             克隆
           </Button>
@@ -178,6 +228,16 @@ export default function AgentsPage() {
         <Button type="primary" icon={<PlusOutlined />} onClick={() => {
           setEditing(null)
           form.resetFields()
+          form.setFieldsValue({
+            skill_type: 'builtin',
+            enabled: true,
+            skills: '[]',
+            mcp_tools: '[]',
+            guardrails: '{}',
+            skill_config: '{}',
+            model_config: '{}',
+            policy_config: '{}',
+          })
           setOpen(true)
         }}>
           创建 Agent
@@ -214,10 +274,15 @@ export default function AgentsPage() {
           <Form.Item name="skill_name" label="Skill" rules={[{ required: true }]}>
             <Select
               placeholder="选择 Skill"
-              options={(form.getFieldValue('stage_type') ? getSkillsForStage(form.getFieldValue('stage_type')) : skills).map((s: any) => ({
+              options={(selectedStage ? getSkillsForStage(selectedStage) : skills).map((s: any) => ({
                 value: s.name, label: `${s.name} — ${s.description || ''}`,
               }))}
               disabled={editing?.is_system}
+              onChange={(name) => {
+                if (!editing?.is_system) {
+                  form.setFieldValue('skills', JSON.stringify([{ name, version: '1.0.0', config: {} }], null, 2))
+                }
+              }}
             />
           </Form.Item>
           <Form.Item name="model_id" label="绑定模型">
@@ -228,6 +293,19 @@ export default function AgentsPage() {
                 value: m.id, label: `${m.name} (${m.provider})`,
               }))}
             />
+          </Form.Item>
+
+          <Form.Item name="instructions" label="Instructions">
+            <TextArea rows={3} placeholder="Agent 执行该阶段时使用的补充指令或 Prompt 约束" />
+          </Form.Item>
+
+          <Divider orientation="left" plain><Text type="secondary">Skills</Text></Divider>
+          <Form.Item
+            name="skills"
+            label="Skills (JSON)"
+            extra="系统 Agent 的核心 Skill 不可修改；自定义 Agent 可配置同阶段不同 Skill 实现。"
+          >
+            <TextArea rows={4} disabled={editing?.is_system} placeholder='[{"name":"test_generation","version":"1.0.0","config":{}}]' />
           </Form.Item>
 
           <Divider orientation="left" plain><Text type="secondary">Skill 配置</Text></Divider>
@@ -243,6 +321,18 @@ export default function AgentsPage() {
           <Divider orientation="left" plain><Text type="secondary">策略配置</Text></Divider>
           <Form.Item name="policy_config" label="Policy Config (JSON)">
             <TextArea rows={3} placeholder='{"max_retry": 3, "require_review": false, "allow_code_modify": true}' />
+          </Form.Item>
+
+          <Divider orientation="left" plain><Text type="secondary">MCP / Guardrails</Text></Divider>
+          <Form.Item
+            name="mcp_tools"
+            label="MCP Tools (JSON)"
+            extra={mcpTools.length ? `当前预留 ${mcpTools.length} 个只读工具描述` : '当前阶段仅预留结构，不执行写操作工具'}
+          >
+            <TextArea rows={4} placeholder='[{"server":"codegraph","tools":["refs","impact"],"permission":"read"}]' />
+          </Form.Item>
+          <Form.Item name="guardrails" label="Guardrails (JSON)">
+            <TextArea rows={4} placeholder='{"allowed_write_patterns":["tests/**"],"deny_shell":true,"max_tool_calls":20}' />
           </Form.Item>
 
           <Form.Item name="enabled" label="启用" valuePropName="checked">

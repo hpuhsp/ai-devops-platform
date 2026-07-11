@@ -4,25 +4,66 @@ Replaces procedural if/else orchestration with a declarative stage-based state m
 Each stage is self-contained: has a run function, can be skipped/gated, and records execution.
 """
 import asyncio
+import importlib.util
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-import structlog
+try:
+    import structlog
+except ModuleNotFoundError:
+    import logging
 
-from app.core.config import settings
-from app.models.task_status import TaskStatus, STAGE_STATUS_MAP
+    class _KeywordLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def debug(self, event: str, **kwargs):
+            self._logger.debug("%s %s", event, kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._logger.info("%s %s", event, kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._logger.warning("%s %s", event, kwargs)
+
+        def exception(self, event: str, **kwargs):
+            self._logger.exception("%s %s", event, kwargs)
+
+    class _StructlogFallback:
+        @staticmethod
+        def get_logger():
+            return _KeywordLogger(__name__)
+
+    structlog = _StructlogFallback()
+
+from app.services.unit_test_engine.schemas import StageResult
 
 logger = structlog.get_logger()
 
 
-@dataclass
-class StageResult:
-    status: str  # "success" | "skipped" | "failed" | "gated"
-    output: dict = field(default_factory=dict)
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    duration_ms: int = 0
+try:
+    from app.models.task_status import TaskStatus, STAGE_STATUS_MAP
+except ModuleNotFoundError:
+    _task_status_path = Path(__file__).resolve().parents[2] / "models" / "task_status.py"
+    _task_status_spec = importlib.util.spec_from_file_location(
+        "_unit_test_engine_task_status",
+        _task_status_path,
+    )
+    _task_status_mod = importlib.util.module_from_spec(_task_status_spec)
+    _task_status_spec.loader.exec_module(_task_status_mod)
+    TaskStatus = _task_status_mod.TaskStatus
+    STAGE_STATUS_MAP = _task_status_mod.STAGE_STATUS_MAP
+
+
+def _setting(name: str, default: Any) -> Any:
+    try:
+        from app.core.config import settings
+
+        return getattr(settings, name, default)
+    except ModuleNotFoundError:
+        return default
 
 
 @dataclass
@@ -50,6 +91,7 @@ class PipelineContext:
 
     # Status callback for fine-grained task status updates (Sprint D)
     status_callback: Optional[Callable] = None
+    ports: Any = None
 
     # Inter-stage data (downstream stages read from here)
     change_intel_data: dict = field(default_factory=dict)
@@ -61,7 +103,7 @@ class PipelineContext:
     quality_score: dict | None = None
 
 
-class TestManagerAgent:
+class UnitTestWorkflow:
     """
     State-machine pipeline orchestrator.
     Drives Agent chain: code_review → change_intelligence → context → generator
@@ -103,6 +145,10 @@ class TestManagerAgent:
     async def run(self, ctx: PipelineContext) -> dict:
         """Execute pipeline stages sequentially. Returns final output dict."""
         self._loop = asyncio.get_event_loop()
+        if ctx.ports is None:
+            from app.services.unit_test_engine.platform_ports import PlatformWorkflowPorts
+
+            ctx.ports = PlatformWorkflowPorts(self._loop)
 
         for stage_name, stage_fn in self._stages:
             try:
@@ -110,6 +156,7 @@ class TestManagerAgent:
                 result = await stage_fn(ctx)
                 ctx.prompt_tokens += result.prompt_tokens
                 ctx.completion_tokens += result.completion_tokens
+                await self._record_stage_result(ctx, stage_name, result)
                 logger.info("pipeline.stage_done", stage=stage_name, status=result.status)
 
                 # Gate: if change_intelligence says no test needed, skip remaining
@@ -151,16 +198,43 @@ class TestManagerAgent:
 
     async def _persist(self, ctx: PipelineContext, key: str, val: dict):
         ctx.output_data[key] = val
-        from app.tasks.ai_tasks import _write_partial_output
-        await self._loop.run_in_executor(None, _write_partial_output, ctx.task_id, key, val)
+        await ctx.ports.persist(ctx, key, val)
 
     def _stage_reason(self, result: StageResult, stage_name: str) -> str:
         return (
-            result.output.get("reason")
+            result.reason
+            or result.output.get("reason")
             or result.output.get("error")
             or result.output.get("message")
             or f"{stage_name} {result.status}"
         )
+
+    async def _record_stage_result(self, ctx: PipelineContext, stage_name: str, result: StageResult):
+        """Collect normalized stage status, metrics, artifacts, and events."""
+        normalized_status = "skipped" if result.status == "gated" else result.status
+        metrics = dict(result.metrics or {})
+        metrics.setdefault("prompt_tokens", result.prompt_tokens)
+        metrics.setdefault("completion_tokens", result.completion_tokens)
+        metrics.setdefault("duration_ms", result.duration_ms)
+
+        stage_record = {
+            "stage": stage_name,
+            "status": normalized_status,
+            "reason": result.reason or result.output.get("reason") or result.output.get("error"),
+            "metrics": metrics,
+            "artifacts": result.artifacts,
+        }
+
+        ctx.output_data.setdefault("stage_results", [])
+        ctx.output_data["stage_results"].append(stage_record)
+
+        if result.events:
+            ctx.output_data.setdefault("events", [])
+            ctx.output_data["events"].extend(result.events)
+
+        await self._persist(ctx, "stage_results", ctx.output_data["stage_results"])
+        if result.events:
+            await self._persist(ctx, "events", ctx.output_data["events"])
 
     async def _mark_pipeline_failed(
         self,
@@ -196,23 +270,39 @@ class TestManagerAgent:
         block_reason = f"Blocked because {stage_name} {status}: {reason}"
         for downstream in stage_names[start:]:
             key = self._STAGE_OUTPUT_KEYS.get(downstream)
-            if not key or key in ctx.output_data:
+            if not key:
                 continue
-            await self._persist(ctx, key, {
+            blocked_output = {
                 "status": "blocked",
                 "blocked_by": stage_name,
                 "reason": block_reason,
-            })
+            }
+            if key not in ctx.output_data:
+                await self._persist(ctx, key, blocked_output)
+            await self._record_stage_result(ctx, downstream, StageResult(
+                status="blocked",
+                reason=block_reason,
+                output=blocked_output,
+            ))
 
     async def _record(self, ctx: PipelineContext, agent_type: str, status: str,
                       input_data=None, output_data=None,
                       pt=0, ct=0, duration_ms=0, round_number=1):
-        from app.tasks.ai_tasks import _record_agent_execution
-        await self._loop.run_in_executor(
-            None, _record_agent_execution,
-            ctx.task_id, agent_type, status,
-            input_data, output_data, pt, ct, duration_ms, round_number,
+        await ctx.ports.record_execution(
+            ctx,
+            agent_type,
+            status,
+            input_data=input_data,
+            output_data=output_data,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            duration_ms=duration_ms,
+            round_number=round_number,
         )
+
+    async def _notify(self, ctx: PipelineContext, notif_data: dict, stage_type: str):
+        """Workflow notification outlet. Stages produce data; policies own routing."""
+        await ctx.ports.notify(ctx, notif_data, stage_type)
 
     def _engine_for(self, ctx: PipelineContext, stage_name: str):
         """Resolve engine for a pipeline stage via AgentResolver."""
@@ -255,6 +345,12 @@ class TestManagerAgent:
                 return name
         return default_name
 
+    def _skill_type_for(self, ctx: PipelineContext, stage_type: str) -> str:
+        """Resolve skill runtime type for a stage."""
+        if ctx.agent_resolver and hasattr(ctx.agent_resolver, "get_skill_type"):
+            return ctx.agent_resolver.get_skill_type(stage_type)
+        return "builtin"
+
     async def _emit_status(self, ctx: PipelineContext, stage_name: str):
         """Emit task status update via callback if available."""
         new_status = STAGE_STATUS_MAP.get(stage_name)
@@ -271,11 +367,17 @@ class TestManagerAgent:
             await self._persist(ctx, "code_review", {"status": "skipped"})
             return StageResult(status="skipped")
 
-        from app.services.skills.registry import skill_registry
+        from app.services.skills.runtime import skill_runtime
         engine = self._engine_for(ctx, "code_review")
         skill_cfg = self._skill_config_for(ctx, "code_review")
         skill_name = await self._skill_name_for(ctx, "code_review", "code_review")
-        cr = await skill_registry.execute(skill_name, ctx.skill_context, engine, skill_config=skill_cfg)
+        cr = await skill_runtime.execute(
+            skill_name,
+            ctx.skill_context,
+            engine,
+            skill_config=skill_cfg,
+            skill_type=self._skill_type_for(ctx, "code_review"),
+        )
         status = "success"
         cr_details = dict(cr.details)
         if not cr.success:
@@ -290,8 +392,7 @@ class TestManagerAgent:
         await self._persist(ctx, "code_review", cr_details)
 
         for notif in cr.notifications:
-            from app.tasks.ai_tasks import _send_notification
-            await _send_notification(notif, ctx.notify_cfg)
+            await self._notify(ctx, notif, "code_review")
 
         return StageResult(
             status=status,
@@ -305,12 +406,18 @@ class TestManagerAgent:
             await self._persist(ctx, "test_generation", {"status": "skipped"})
             return StageResult(status="gated")
 
-        from app.services.skills.registry import skill_registry
+        from app.services.skills.runtime import skill_runtime
         start = time.time()
         engine = self._engine_for(ctx, "change_intelligence")
         ci_skill_cfg = self._skill_config_for(ctx, "change_intelligence")
         skill_name = await self._skill_name_for(ctx, "change_intelligence", "change_intelligence")
-        ci_result = await skill_registry.execute(skill_name, ctx.skill_context, engine, skill_config=ci_skill_cfg)
+        ci_result = await skill_runtime.execute(
+            skill_name,
+            ctx.skill_context,
+            engine,
+            skill_config=ci_skill_cfg,
+            skill_type=self._skill_type_for(ctx, "change_intelligence"),
+        )
         ms = int((time.time() - start) * 1000)
 
         ci_data = ci_result.details
@@ -392,7 +499,7 @@ class TestManagerAgent:
         return StageResult(status="success", output=context_output, duration_ms=ms)
 
     async def _stage_generator(self, ctx: PipelineContext) -> StageResult:
-        from app.services.skills.registry import skill_registry
+        from app.services.skills.runtime import skill_runtime
         test_cfg = ctx.skills_config.get("test_generation", {})
         agent_skill_cfg = self._skill_config_for(ctx, "generator")
         merged_cfg = {**{k: v for k, v in test_cfg.items() if k != "enabled"}, **agent_skill_cfg}
@@ -400,9 +507,10 @@ class TestManagerAgent:
 
         start = time.time()
         skill_name = await self._skill_name_for(ctx, "generator", "test_generation")
-        tg = await skill_registry.execute(
+        tg = await skill_runtime.execute(
             skill_name, ctx.skill_context, engine,
             skill_config=merged_cfg,
+            skill_type=self._skill_type_for(ctx, "generator"),
         )
         ms = int((time.time() - start) * 1000)
 
@@ -474,8 +582,6 @@ class TestManagerAgent:
         # Persist full test_generation output (generator output + worktree + repair)
         tg_output = ctx.output_data.get("test_generation", {})
         if not isinstance(tg_output, dict) or tg_output.get("status") == "skipped":
-            # Build from generator stage output (stored in the previous StageResult)
-            from app.services.skills.registry import skill_registry
             tg_output = {}
         # Merge worktree result
         generator_output = {
@@ -489,7 +595,6 @@ class TestManagerAgent:
         await self._persist(ctx, "test_generation", generator_output)
 
         # Send notifications
-        from app.tasks.ai_tasks import _send_notification
         notif_data = {
             "type": "test_generation_result",
             "data": {"worktree_run": wr, "files": ctx.generated_files},
@@ -500,12 +605,12 @@ class TestManagerAgent:
                 "files_count": len(ctx.generated_files),
             },
         }
-        await _send_notification(notif_data, ctx.notify_cfg)
+        await self._notify(ctx, notif_data, "test_generation")
 
         return StageResult(status=stage_status, output=wr)
 
     async def _stage_quality_scorer(self, ctx: PipelineContext) -> StageResult:
-        if not ctx.generated_files or not settings.TEST_QUALITY_SCORING_ENABLED:
+        if not ctx.generated_files or not _setting("TEST_QUALITY_SCORING_ENABLED", True):
             return StageResult(status="skipped")
 
         from app.services.agents.quality_scorer import QualityScorer
@@ -526,7 +631,6 @@ class TestManagerAgent:
         await self._record(ctx, "quality_scorer", "success", None, quality_score, pt, ct, ms)
 
         # Send notification with quality_score for Feishu card
-        from app.tasks.ai_tasks import _send_notification
         notif_data = {
             "type": "quality_score_result",
             "data": {
@@ -542,45 +646,18 @@ class TestManagerAgent:
             },
             "quality_score": quality_score,
         }
-        await _send_notification(notif_data, ctx.notify_cfg)
+        await self._notify(ctx, notif_data, "quality_scorer")
 
         return StageResult(status="success", output=quality_score,
                            prompt_tokens=pt, completion_tokens=ct, duration_ms=ms)
 
     async def _stage_mr_feedback(self, ctx: PipelineContext) -> StageResult:
-        if not settings.MR_COMMENT_ENABLED:
+        if not _setting("MR_COMMENT_ENABLED", False):
             return StageResult(status="skipped")
+        return StageResult(status="success", output=await ctx.ports.publish_mr_feedback(ctx))
 
-        mr_iid = ctx.event_data.get("mr_iid") or ctx.event_data.get("pr_number")
-        ai_branch = None
 
-        # Push AI branch if tests passed
-        if ctx.generated_files and ctx.worktree_result.get("status") == "passed":
-            commit_sha = ctx.skill_context.commit_sha or "unknown"
-            short_sha = commit_sha[:8]
-            ai_branch = f"ai/test/{mr_iid or short_sha}"
-            push_result = await self._loop.run_in_executor(
-                None, ctx.git_agent.push_ai_branch,
-                ctx.skill_context.branch or commit_sha,
-                ai_branch, ctx.generated_files,
-            )
-            if not push_result.get("success"):
-                logger.warning("ai_branch.push_failed", error=push_result.get("error"))
-                ai_branch = None
+class TestManagerAgent(UnitTestWorkflow):
+    """Backward-compatible alias for the extracted unit test workflow."""
 
-        # Post MR comment
-        if mr_iid and ctx.git_token:
-            from app.services.notify.mr_comment import MRCommentService, build_test_report_comment
-            comment_body = build_test_report_comment(
-                change_intel=ctx.change_intel_data,
-                test_result=ctx.output_data.get("test_generation", {}),
-                repair_history=ctx.repair_history,
-                ai_branch=ai_branch,
-                quality_score=ctx.quality_score,
-            )
-            mr_svc = MRCommentService(
-                ctx.repo.platform, ctx.repo.repo_url, ctx.git_token
-            )
-            await mr_svc.post_comment(str(mr_iid), comment_body)
-
-        return StageResult(status="success", output={"ai_branch": ai_branch, "mr_iid": mr_iid})
+    pass

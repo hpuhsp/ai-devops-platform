@@ -9,7 +9,7 @@ import httpx
 
 from app.core.database import get_db
 from app.core.security import encrypt, decrypt
-from app.models import AIModel, Repository, NotifyConfig, NotificationLog
+from app.models import AIModel, Repository, NotifyConfig, NotificationLog, NotificationPolicy
 from app.services.git.webhook_parser import _normalize_url
 
 router = APIRouter()
@@ -357,7 +357,8 @@ async def update_repo(repo_id: int, body: RepoCreate, db: AsyncSession = Depends
         repo.git_token_encrypted = encrypt(body.git_token)
     repo.branch_rules = body.branch_rules
     repo.skills_config = body.skills_config
-    repo.agent_bindings = body.agent_bindings
+    if "agent_bindings" in body.model_fields_set:
+        repo.agent_bindings = body.agent_bindings
     repo.enabled = body.enabled
     await db.commit()
     return {"success": True}
@@ -449,6 +450,11 @@ async def delete_notify(nc_id: int, db: AsyncSession = Depends(get_db)):
     await db.execute(
         update(NotificationLog)
         .where(NotificationLog.notify_config_id == nc_id)
+        .values(notify_config_id=None)
+    )
+    await db.execute(
+        update(NotificationPolicy)
+        .where(NotificationPolicy.notify_config_id == nc_id)
         .values(notify_config_id=None)
     )
 

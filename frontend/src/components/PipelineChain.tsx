@@ -84,8 +84,8 @@ function NodeIcon({ node, Meta, phase2 }: { node: PipelineNode | undefined; Meta
   if (node.status === 'skipped' || node.status === 'skip') return <MinusCircleOutlined className="pipeline-icon" style={{ color: '#bfbfbf', fontSize: 14 }} />
   const s = node.pytest_status || node.status
   if (s === 'passed' || s === 'done')    return <CheckCircleOutlined  className="pipeline-icon" style={{ fontSize: 14 }} />
-  if (s === 'failed' || s === 'blocked') return <CloseCircleOutlined  className="pipeline-icon" style={{ fontSize: 14 }} />
   if (s === 'blocked') return <StopOutlined className="pipeline-icon" style={{ fontSize: 14 }} />
+  if (s === 'failed') return <CloseCircleOutlined  className="pipeline-icon" style={{ fontSize: 14 }} />
   return <Icon className="pipeline-icon" style={{ fontSize: 14 }} />
 }
 

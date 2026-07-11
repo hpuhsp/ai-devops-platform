@@ -1,19 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Table, Button, Modal, Form, Input, Select, Space, Popconfirm, message, Tag, Switch, Divider, Typography, Checkbox } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
-import { listRepos, createRepo, updateRepo, deleteRepo, listModels, listAgents, listNotify } from '../../services/api'
+import { listRepos, createRepo, updateRepo, deleteRepo, listNotify } from '../../services/api'
 
 const { Text } = Typography
 
 const PLATFORMS = ['gitlab', 'github', 'gitea']
-
-const STAGE_OPTIONS = [
-  { value: 'code_review', label: '代码审查' },
-  { value: 'change_intelligence', label: '变更智能' },
-  { value: 'generator', label: '测试生成' },
-  { value: 'validate_repair', label: '验证修复' },
-  { value: 'quality_scorer', label: '质量评分' },
-]
 
 const NOTIFY_EVENT_OPTIONS = [
   { value: 'code_review_result', label: '代码审查' },
@@ -37,8 +29,6 @@ const DEFAULT_NOTIFICATION_SETTINGS = {
 
 export default function RepositoriesPage() {
   const [repos, setRepos] = useState<any[]>([])
-  const [models, setModels] = useState<any[]>([])
-  const [agents, setAgents] = useState<any[]>([])
   const [notifyConfigs, setNotifyConfigs] = useState<any[]>([])
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<any>(null)
@@ -47,19 +37,12 @@ export default function RepositoriesPage() {
 
   const load = () => Promise.all([
     listRepos().then(setRepos),
-    listModels().then(setModels),
-    listAgents().then(setAgents),
     listNotify().then(setNotifyConfigs),
   ])
   useEffect(() => { load() }, [])
 
   const handleSubmit = async () => {
     const values = await form.validateFields()
-    const agentBindings: Record<string, number> = {}
-    const rawBindings = values.agent_bindings || {}
-    for (const [stage, agentId] of Object.entries(rawBindings)) {
-      if (agentId) agentBindings[stage] = agentId as number
-    }
     const payload = {
       ...values,
       skills_config: {
@@ -69,7 +52,6 @@ export default function RepositoriesPage() {
           ...((values.skills_config || {}).notifications || {}),
         },
       },
-      agent_bindings: agentBindings,
     }
     setLoading(true)
     try {
@@ -77,11 +59,6 @@ export default function RepositoriesPage() {
       else { await createRepo(payload); message.success('添加成功') }
       setOpen(false); form.resetFields(); setEditing(null); load()
     } catch { message.error('操作失败') } finally { setLoading(false) }
-  }
-
-  const getAgentName = (agentId: number) => {
-    const a = agents.find(a => a.id === agentId)
-    return a ? a.name : `#${agentId}`
   }
 
   const getNotifyName = (id?: number) => {
@@ -93,23 +70,6 @@ export default function RepositoriesPage() {
     { title: '名称', dataIndex: 'name' },
     { title: '平台', dataIndex: 'platform', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { title: '仓库地址', dataIndex: 'repo_url', ellipsis: true },
-    {
-      title: 'Agent 绑定',
-      render: (_: any, r: any) => {
-        const bindings = r.agent_bindings || {}
-        const count = Object.keys(bindings).length
-        if (count === 0) return <Tag>默认</Tag>
-        return (
-          <Space direction="vertical" size={0}>
-            {Object.entries(bindings).map(([stage, id]: [string, any]) => (
-              <Tag key={stage} color="cyan" style={{ fontSize: 11 }}>
-                {STAGE_OPTIONS.find(s => s.value === stage)?.label || stage}: {getAgentName(id)}
-              </Tag>
-            ))}
-          </Space>
-        )
-      },
-    },
     {
       title: '通知策略',
       width: 190,
@@ -141,7 +101,6 @@ export default function RepositoriesPage() {
             setEditing(r)
             form.setFieldsValue({
               ...r,
-              agent_bindings: r.agent_bindings || {},
               skills_config: {
                 ...(r.skills_config || {}),
                 notifications: {
@@ -176,7 +135,7 @@ export default function RepositoriesPage() {
           添加仓库
         </Button>
       </div>
-      <Table dataSource={repos} columns={columns} rowKey="id" size="small" scroll={{ x: 800 }} />
+      <Table dataSource={repos} columns={columns} rowKey="id" size="small" scroll={{ x: 760 }} />
 
       <Modal title={editing ? '编辑仓库' : '添加仓库'} open={open} onOk={handleSubmit} onCancel={() => setOpen(false)} confirmLoading={loading} width={640}>
         <Form form={form} layout="vertical">
@@ -193,30 +152,6 @@ export default function RepositoriesPage() {
           <Form.Item name="webhook_secret" label="Webhook Secret">
             <Input.Password />
           </Form.Item>
-
-          <Divider style={{ margin: '12px 0' }}>Agent 绑定</Divider>
-          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>
-            为不同流水线阶段绑定专属 Agent，Agent 可独立配置模型、Skill 和策略。
-            留空则使用系统默认 Agent。在「Agent 管理」页面创建自定义 Agent。
-          </Text>
-          {STAGE_OPTIONS.map(stage => (
-            <Form.Item
-              key={stage.value}
-              name={['agent_bindings', stage.value]}
-              label={stage.label}
-            >
-              <Select
-                allowClear
-                placeholder="使用默认 Agent"
-                options={agents
-                  .filter(a => a.stage_type === stage.value)
-                  .map(a => ({
-                    value: a.id,
-                    label: `${a.name}${a.model_id ? ` [${models.find(m => m.id === a.model_id)?.name || ''}]` : ''}`,
-                  }))}
-              />
-            </Form.Item>
-          ))}
 
           <Divider style={{ margin: '12px 0' }}>通知策略</Divider>
           <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>

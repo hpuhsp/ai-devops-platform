@@ -53,7 +53,7 @@ def match_policy(
         return False
 
     # Repo filter
-    if policy.repo_ids and repo_id is not None and repo_id not in policy.repo_ids:
+    if policy.repo_ids and (repo_id is None or repo_id not in policy.repo_ids):
         return False
 
     # Branch filter

@@ -34,6 +34,8 @@ export const deleteAgent = (id: number) => api.delete(`/api/v1/agents/${id}`)
 export const cloneAgent = (id: number) => api.post(`/api/v1/agents/${id}/clone`).then(r => r.data)
 export const listAgentSkills = () => api.get('/api/v1/agents/skills').then(r => r.data)
 export const listAgentStages = () => api.get('/api/v1/agents/stages').then(r => r.data)
+export const listAgentMcpTools = () => api.get('/api/v1/agents/mcp-tools').then(r => r.data)
+export const validateAgent = (id: number) => api.post(`/api/v1/agents/${id}/validate`).then(r => r.data)
 
 // ── Notify Configs ─────────────────────────────────────────────────────
 export const listNotify = () => api.get('/api/v1/notify-configs').then(r => r.data)
@@ -46,6 +48,12 @@ export const listNotifyLogs = (params?: any) => api.get('/api/v1/notify-logs', {
 // ── Tasks ──────────────────────────────────────────────────────────────
 export const listTasks = (params?: any) => api.get('/api/v1/tasks', { params }).then(r => r.data)
 export const getTask = (taskId: string) => api.get(`/api/v1/tasks/${taskId}`).then(r => r.data)
+export const getTaskStages = (taskId: string) => api.get(`/api/v1/tasks/${taskId}/stages`).then(r => r.data)
+export const getTaskArtifacts = (taskId: string) => api.get(`/api/v1/tasks/${taskId}/artifacts`).then(r => r.data)
+export const getTaskEvents = (taskId: string) => api.get(`/api/v1/tasks/${taskId}/events`).then(r => r.data)
+
+// ── Unit test workflow ─────────────────────────────────────────────────
+export const triggerUnitTest = (data: any) => api.post('/api/v1/unit-test/trigger', data).then(r => r.data)
 
 // ── Push event pipeline list ───────────────────────────────────────────
 export const listEvents = (params?: any) => api.get('/api/v1/tasks/events', { params }).then(r => r.data)

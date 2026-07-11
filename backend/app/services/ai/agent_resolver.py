@@ -14,7 +14,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Any
 
-import structlog
+try:
+    import structlog
+except ModuleNotFoundError:
+    import logging
+
+    class _KeywordLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def warning(self, event: str, **kwargs):
+            self._logger.warning("%s %s", event, kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._logger.info("%s %s", event, kwargs)
+
+    class _StructlogFallback:
+        @staticmethod
+        def get_logger():
+            return _KeywordLogger(__name__)
+
+    structlog = _StructlogFallback()
 
 logger = structlog.get_logger()
 
@@ -26,7 +46,12 @@ class AgentBinding:
     agent_name: str
     stage_type: str
     skill_name: str
+    skill_type: str = "builtin"
     model_id: Optional[int] = None
+    instructions: Optional[str] = None
+    skills: list[dict] = field(default_factory=list)
+    mcp_tools: list[dict] = field(default_factory=list)
+    guardrails: dict = field(default_factory=dict)
     skill_config: dict = field(default_factory=dict)
     model_config: dict = field(default_factory=dict)
     policy_config: dict = field(default_factory=dict)
@@ -84,6 +109,21 @@ class AgentResolver:
         binding = self._bindings.get(stage_type)
         return binding.skill_name if binding else None
 
+    def get_skill_type(self, stage_type: str) -> str:
+        """Return configured skill type for a stage."""
+        binding = self._bindings.get(stage_type)
+        return binding.skill_type if binding else "builtin"
+
+    def get_skills(self, stage_type: str) -> list[dict]:
+        """Return configured skills for a stage."""
+        binding = self._bindings.get(stage_type)
+        return binding.skills if binding else []
+
+    def get_guardrails(self, stage_type: str) -> dict:
+        """Return guardrails for a stage."""
+        binding = self._bindings.get(stage_type)
+        return binding.guardrails if binding else {}
+
     def get_model_usage(self) -> dict[str, str]:
         """Return {stage_type: model_label} for all bound stages."""
         usage: dict[str, str] = {}
@@ -107,10 +147,38 @@ class AgentResolver:
                 "stage_type": stage_type,
                 "agent_id": binding.agent_id,
                 "agent_name": binding.agent_name,
+                "skill_type": binding.skill_type,
                 "skill_name": binding.skill_name,
+                "skills": binding.skills,
+                "mcp_tools": binding.mcp_tools,
                 "model": model_label,
             })
         return summaries
+
+
+def _skills_for_agent(agent) -> list[dict]:
+    skills = getattr(agent, "skills", None) or []
+    if skills:
+        return skills
+    return [{"name": agent.skill_name, "version": "1.0.0", "config": {}}]
+
+
+def _binding_from_agent(agent, stage_type: str | None = None) -> AgentBinding:
+    return AgentBinding(
+        agent_id=agent.id,
+        agent_name=agent.name,
+        stage_type=stage_type or agent.stage_type,
+        skill_type=getattr(agent, "skill_type", None) or "builtin",
+        skill_name=agent.skill_name,
+        model_id=agent.model_id,
+        instructions=getattr(agent, "instructions", None),
+        skills=_skills_for_agent(agent),
+        mcp_tools=getattr(agent, "mcp_tools", None) or [],
+        guardrails=getattr(agent, "guardrails", None) or {},
+        skill_config=agent.skill_config or {},
+        model_config=agent.model_config or {},
+        policy_config=agent.policy_config or {},
+    )
 
 
 def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> AgentResolver:
@@ -138,16 +206,7 @@ def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> AgentResol
     ).all()
 
     for agent in system_agents:
-        bindings[agent.stage_type] = AgentBinding(
-            agent_id=agent.id,
-            agent_name=agent.name,
-            stage_type=agent.stage_type,
-            skill_name=agent.skill_name,
-            model_id=agent.model_id,
-            skill_config=agent.skill_config or {},
-            model_config=agent.model_config or {},
-            policy_config=agent.policy_config or {},
-        )
+        bindings[agent.stage_type] = _binding_from_agent(agent)
 
     # ── Layer 2: Repo bindings overlay ────────────────────────────────────
     bindings_raw = getattr(repo, "agent_bindings", None) or {}
@@ -167,16 +226,7 @@ def build_agent_resolver_sync(repo, fallback_engine, sync_session) -> AgentResol
                     stage_type=stage_type, agent_id=agent_id,
                 )
                 continue
-            bindings[stage_type] = AgentBinding(
-                agent_id=agent.id,
-                agent_name=agent.name,
-                stage_type=stage_type,
-                skill_name=agent.skill_name,
-                model_id=agent.model_id,
-                skill_config=agent.skill_config or {},
-                model_config=agent.model_config or {},
-                policy_config=agent.policy_config or {},
-            )
+            bindings[stage_type] = _binding_from_agent(agent, stage_type=stage_type)
 
     # ── Build engines for all referenced models ───────────────────────────
     model_ids = {b.model_id for b in bindings.values() if b.model_id is not None}

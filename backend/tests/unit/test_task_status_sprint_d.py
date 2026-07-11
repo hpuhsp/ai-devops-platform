@@ -198,8 +198,8 @@ class TestEmitStatus:
 
 # ── _build_pipeline_nodes with new statuses ──────────────────────────────────
 
-def _load_build_pipeline_nodes():
-    """Load _build_pipeline_nodes without triggering fastapi/sqlalchemy imports."""
+def _load_tasks_endpoint():
+    """Load tasks endpoint helpers without requiring FastAPI/SQLAlchemy runtime deps."""
     import types
     for mod_name in ["fastapi", "fastapi.responses", "sqlalchemy.ext.asyncio",
                      "sqlalchemy", "app.core.database"]:
@@ -217,7 +217,11 @@ def _load_build_pipeline_nodes():
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod._build_pipeline_nodes
+    return mod
+
+
+def _load_build_pipeline_nodes():
+    return _load_tasks_endpoint()._build_pipeline_nodes
 
 
 class TestBuildPipelineNodesNewStatuses:
@@ -336,6 +340,106 @@ class TestBuildPipelineNodesNewStatuses:
         nodes = fn(task)
         assert nodes["code_review"]["status"] == "failed"
         assert nodes["code_review"]["error"] == "llm timeout"
+
+
+class TestTaskStageArtifactsEvents:
+    def _make_task(self, status: str = "success", output_data: dict = None):
+        task = MagicMock()
+        task.status = status
+        task.output_data = output_data or {}
+        task.task_id = "task-1"
+        return task
+
+    def test_stage_results_prefer_workflow_records(self):
+        mod = _load_tasks_endpoint()
+        task = self._make_task(output_data={
+            "stage_results": [
+                {"stage": "generator", "status": "failed", "reason": "no files"},
+                "bad-record",
+            ],
+        })
+
+        results = mod._task_stage_results(task)
+
+        assert results == [
+            {"stage": "generator", "status": "failed", "reason": "no files"},
+        ]
+
+    def test_stage_results_fallback_from_pipeline_nodes(self):
+        mod = _load_tasks_endpoint()
+        task = self._make_task(status="failed", output_data={
+            "test_generation": {
+                "status": "failed",
+                "reason": "no files generated",
+                "generated_files": [],
+                "worktree_run": {"status": "failed"},
+            },
+        })
+
+        results = mod._task_stage_results(task)
+        generator = next(item for item in results if item["stage"] == "test_generation")
+        quality = next(item for item in results if item["stage"] == "quality_score")
+
+        assert generator["status"] == "failed"
+        assert generator["reason"] == "no files generated"
+        assert quality["status"] == "blocked"
+        assert quality["blocked_by"] == "test_generation"
+
+    def test_artifacts_include_stage_artifacts_and_generated_tests(self):
+        mod = _load_tasks_endpoint()
+        task = self._make_task(output_data={
+            "stage_results": [
+                {
+                    "stage": "generator",
+                    "status": "success",
+                    "artifacts": [{"type": "summary", "content": {"files": 1}}],
+                },
+            ],
+            "test_generation": {
+                "generated_files": [
+                    {"path": "tests/test_demo.py", "content": "def test_demo(): pass"},
+                    "tests/test_legacy.py",
+                ],
+            },
+        })
+
+        artifacts = mod._task_artifacts(task)
+
+        assert artifacts[0]["stage"] == "generator"
+        assert artifacts[0]["type"] == "summary"
+        assert artifacts[1]["type"] == "generated_test"
+        assert artifacts[1]["path"] == "tests/test_demo.py"
+        assert artifacts[2]["path"] == "tests/test_legacy.py"
+
+    def test_events_prefer_workflow_events(self):
+        mod = _load_tasks_endpoint()
+        task = self._make_task(output_data={
+            "events": [
+                {"event": "stage_started", "stage": "generator"},
+                "bad-record",
+            ],
+        })
+
+        assert mod._task_events(task) == [
+            {"event": "stage_started", "stage": "generator"},
+        ]
+
+    def test_events_fallback_from_stage_results(self):
+        mod = _load_tasks_endpoint()
+        task = self._make_task(output_data={
+            "stage_results": [
+                {"stage": "generator", "status": "failed", "reason": "no files"},
+            ],
+        })
+
+        assert mod._task_events(task) == [
+            {
+                "event": "stage_status",
+                "stage": "generator",
+                "status": "failed",
+                "reason": "no files",
+            },
+        ]
 
 
 class TestManagerPipelineTerminalBehavior:

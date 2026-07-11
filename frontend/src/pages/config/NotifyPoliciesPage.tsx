@@ -72,15 +72,36 @@ export default function NotifyPoliciesPage() {
     return notifyConfigs.find(n => n.id === id)?.name || `#${id}`
   }
 
+  const formatTargets = (targets: any[]) => JSON.stringify(targets || [], null, 2)
+
+  const parseTargets = (value: any) => {
+    if (!value || (typeof value === 'string' && !value.trim())) return []
+    if (Array.isArray(value)) return value
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      throw new Error('targets_json_invalid')
+    }
+  }
+
   const handleSubmit = async () => {
     const values = await form.validateFields()
+    let targets: any[] = []
+    try {
+      targets = parseTargets(values.targets)
+    } catch {
+      message.error('接收目标 JSON 格式不正确')
+      return
+    }
+    const payload = { ...values, targets }
     setLoading(true)
     try {
       if (editing) {
-        await updatePolicy(editing.id, values)
+        await updatePolicy(editing.id, payload)
         message.success('更新成功')
       } else {
-        await createPolicy(values)
+        await createPolicy(payload)
         message.success('创建成功')
       }
       setOpen(false); form.resetFields(); setEditing(null); load()
@@ -120,6 +141,7 @@ export default function NotifyPoliciesPage() {
         <Space size={2} wrap>
           {r.min_severity !== 'all' && <Tag color="orange">{r.min_severity}+</Tag>}
           {r.blocked_only && <Tag color="red">仅拦截</Tag>}
+          {(r.branch_patterns || []).slice(0, 2).map((p: string) => <Tag key={p}>{p}</Tag>)}
           {(r.status_filter || []).map((s: string) => <Tag key={s}>{STATUS_OPTIONS.find(o => o.value === s)?.label || s}</Tag>)}
         </Space>
       ),
@@ -127,6 +149,10 @@ export default function NotifyPoliciesPage() {
     {
       title: '通知渠道', dataIndex: 'notify_config_id', width: 120,
       render: (v: number) => <Tag color={v ? 'green' : 'default'}>{getNotifyName(v)}</Tag>,
+    },
+    {
+      title: '接收目标', dataIndex: 'targets', width: 100,
+      render: (v: any[]) => <Tag>{v?.length ? `${v.length} 个目标` : '渠道默认'}</Tag>,
     },
     {
       title: '优先级', dataIndex: 'priority', width: 80,
@@ -141,7 +167,7 @@ export default function NotifyPoliciesPage() {
       render: (_: any, r: any) => (
         <Space>
           <Button size="small" onClick={() => {
-            setEditing(r); form.setFieldsValue(r); setOpen(true)
+            setEditing(r); form.setFieldsValue({ ...r, targets: formatTargets(r.targets) }); setOpen(true)
           }}>编辑</Button>
           <Button size="small" icon={<SendOutlined />} onClick={() => handleTest(r.id)}>测试</Button>
           <Popconfirm title="确认删除？" onConfirm={() => deletePolicy(r.id).then(load)}>
@@ -157,7 +183,7 @@ export default function NotifyPoliciesPage() {
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
         <span style={{ fontSize: 16, fontWeight: 600 }}>通知策略</span>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => {
-          setEditing(null); form.resetFields(); form.setFieldsValue({ enabled: true, priority: 50, min_severity: 'all', repo_ids: [], event_types: [], stage_types: [], status_filter: [], targets: [] }); setOpen(true)
+          setEditing(null); form.resetFields(); form.setFieldsValue({ enabled: true, priority: 50, min_severity: 'all', repo_ids: [], branch_patterns: [], event_types: [], stage_types: [], status_filter: [], targets: '[]' }); setOpen(true)
         }}>
           创建策略
         </Button>
@@ -188,6 +214,13 @@ export default function NotifyPoliciesPage() {
             <Select mode="multiple" allowClear placeholder="全部仓库"
               options={repos.map(r => ({ value: r.id, label: r.name }))} />
           </Form.Item>
+          <Form.Item
+            name="branch_patterns"
+            label="分支模式（空=全部）"
+            extra="支持 main、release/*、feature/* 等通配符"
+          >
+            <Select mode="tags" allowClear placeholder="全部分支" />
+          </Form.Item>
           <Form.Item name="event_types" label="事件类型（空=全部）">
             <Select mode="multiple" allowClear placeholder="全部事件" options={EVENT_OPTIONS} />
           </Form.Item>
@@ -213,6 +246,13 @@ export default function NotifyPoliciesPage() {
           <Form.Item name="notify_config_id" label="通知渠道" rules={[{ required: true, message: '请选择通知渠道' }]}>
             <Select placeholder="选择通知渠道"
               options={notifyConfigs.map(n => ({ value: n.id, label: n.name }))} />
+          </Form.Item>
+          <Form.Item
+            name="targets"
+            label="接收目标 JSON"
+            extra='为空或 [] 时使用通知渠道默认目标；可填 [{"type":"webhook","name":"QA群","webhook_url":"https://..."}]'
+          >
+            <Input.TextArea rows={4} />
           </Form.Item>
 
           <Space>

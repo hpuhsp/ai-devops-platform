@@ -2,7 +2,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,15 +15,15 @@ router = APIRouter()
 class PolicyCreate(BaseModel):
     name: str
     description: Optional[str] = None
-    repo_ids: list[int] = []
-    branch_patterns: list[str] = []
-    event_types: list[str] = []
-    stage_types: list[str] = []
-    status_filter: list[str] = []
+    repo_ids: list[int] = Field(default_factory=list)
+    branch_patterns: list[str] = Field(default_factory=list)
+    event_types: list[str] = Field(default_factory=list)
+    stage_types: list[str] = Field(default_factory=list)
+    status_filter: list[str] = Field(default_factory=list)
     min_severity: str = "all"
     blocked_only: bool = False
     notify_config_id: Optional[int] = None
-    targets: list[dict] = []
+    targets: list[dict] = Field(default_factory=list)
     enabled: bool = True
     priority: int = 50
 
@@ -132,23 +132,35 @@ async def test_policy(policy_id: int, db: AsyncSession = Depends(get_db)):
     if not notify_config:
         raise HTTPException(status_code=404, detail="Notify config not found")
 
-    cfg = {
-        "id": notify_config.id,
-        "name": notify_config.name,
-        "provider": notify_config.provider,
-        "config": notify_config.config,
-    }
+    sent = 0
+    failed = 0
+    targets = policy.targets or [{"type": "notify_config", "name": notify_config.name}]
+    for target in targets:
+        cfg = dict(notify_config.config or {})
+        if target.get("webhook_url"):
+            cfg["webhook_url"] = target["webhook_url"]
+        if target.get("sign_key"):
+            cfg["sign_key"] = target["sign_key"]
 
-    provider = build_notify_provider(cfg)
-    msg = NotifyMessage(
-        title="通知策略测试",
-        content=f"策略「{policy.name}」测试发送成功",
-        message_type="test",
-        data={"policy_name": policy.name},
-        color="green",
-    )
-    ok = await provider.send(msg)
-    if not ok:
+        provider = build_notify_provider({
+            "id": notify_config.id,
+            "name": notify_config.name,
+            "provider": notify_config.provider,
+            "config": cfg,
+        })
+        msg = NotifyMessage(
+            title="通知策略测试",
+            content=f"策略「{policy.name}」测试发送成功",
+            message_type="test",
+            data={"policy_name": policy.name, "target": target},
+            color="green",
+        )
+        if await provider.send(msg):
+            sent += 1
+        else:
+            failed += 1
+
+    if sent == 0:
         raise HTTPException(status_code=500, detail="Test send failed")
 
-    return {"status": "sent", "policy_id": policy.id}
+    return {"status": "sent", "policy_id": policy.id, "sent": sent, "failed": failed}

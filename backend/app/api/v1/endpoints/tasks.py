@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
-from typing import Optional
+from typing import Any, Optional
 import asyncio
 import json
 
@@ -13,9 +13,13 @@ from app.models import AITask, AgentExecution
 router = APIRouter()
 
 
+def _output_data(task: AITask) -> dict[str, Any]:
+    return task.output_data if isinstance(task.output_data, dict) else {}
+
+
 def _build_pipeline_nodes(task: AITask) -> dict:
     """Derive per-node status from output_data and overall task status."""
-    od = task.output_data or {}
+    od = _output_data(task)
     overall = task.status  # created/analyzing/generating/executing/repairing/success/failed
 
     _ACTIVE = {"created", "analyzing", "generating", "executing", "repairing", "pending", "running"}
@@ -200,6 +204,103 @@ def _task_to_event(task: AITask) -> dict:
     }
 
 
+def _fallback_stage_results(task: AITask) -> list[dict[str, Any]]:
+    pipeline = _build_pipeline_nodes(task)
+    results: list[dict[str, Any]] = []
+    for stage, node in pipeline.items():
+        if not isinstance(node, dict):
+            continue
+        status = node.get("status", "pending")
+        if status == "done":
+            status = "success"
+        if status == "skip":
+            status = "skipped"
+        metrics = {
+            key: value
+            for key, value in node.items()
+            if key not in {"status", "reason", "error", "blocked_by", "message"}
+            and value is not None
+        }
+        result: dict[str, Any] = {
+            "stage": stage,
+            "status": status,
+            "metrics": metrics,
+            "artifacts": [],
+        }
+        for key in ("reason", "error", "blocked_by", "message"):
+            if node.get(key):
+                result[key] = node[key]
+        results.append(result)
+    return results
+
+
+def _task_stage_results(task: AITask) -> list[dict[str, Any]]:
+    od = _output_data(task)
+    stage_results = od.get("stage_results")
+    if isinstance(stage_results, list):
+        return [item for item in stage_results if isinstance(item, dict)]
+    return _fallback_stage_results(task)
+
+
+def _task_artifacts(task: AITask) -> list[dict[str, Any]]:
+    od = _output_data(task)
+    artifacts: list[dict[str, Any]] = []
+
+    for result in _task_stage_results(task):
+        for artifact in result.get("artifacts") or []:
+            if isinstance(artifact, dict):
+                artifacts.append({"stage": result.get("stage"), **artifact})
+
+    test_generation = od.get("test_generation")
+    if isinstance(test_generation, dict):
+        for generated in test_generation.get("generated_files") or []:
+            if isinstance(generated, dict):
+                artifact = {
+                    "stage": "test_generation",
+                    "type": "generated_test",
+                    "path": generated.get("path") or generated.get("file_path"),
+                }
+                if generated.get("content") is not None:
+                    artifact["content"] = generated.get("content")
+                artifacts.append(artifact)
+            elif isinstance(generated, str):
+                artifacts.append({
+                    "stage": "test_generation",
+                    "type": "generated_test",
+                    "path": generated,
+                })
+
+    quality_score = od.get("quality_score")
+    if isinstance(quality_score, dict):
+        artifacts.append({
+            "stage": "quality_score",
+            "type": "quality_report",
+            "content": quality_score,
+        })
+
+    return artifacts
+
+
+def _task_events(task: AITask) -> list[dict[str, Any]]:
+    od = _output_data(task)
+    events = od.get("events")
+    if isinstance(events, list):
+        return [item for item in events if isinstance(item, dict)]
+
+    derived_events = []
+    for result in _task_stage_results(task):
+        stage = result.get("stage")
+        status = result.get("status")
+        if stage and status:
+            derived_events.append({
+                "event": "stage_status",
+                "stage": stage,
+                "status": status,
+                "reason": result.get("reason") or result.get("error"),
+            })
+    return derived_events
+
+
 # ── Push event list (pipeline chain view) ────────────────────────────────────
 
 @router.get("/events")
@@ -300,13 +401,45 @@ async def list_tasks(
     }
 
 
-@router.get("/{task_id}")
-async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
+async def _get_task_or_404(task_id: str, db: AsyncSession) -> AITask:
     task = (await db.execute(
         select(AITask).where(AITask.task_id == task_id)
     )).scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@router.get("/{task_id}/stages")
+async def get_task_stages(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await _get_task_or_404(task_id, db)
+    return {
+        "task_id": task.task_id,
+        "items": _task_stage_results(task),
+    }
+
+
+@router.get("/{task_id}/artifacts")
+async def get_task_artifacts(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await _get_task_or_404(task_id, db)
+    return {
+        "task_id": task.task_id,
+        "items": _task_artifacts(task),
+    }
+
+
+@router.get("/{task_id}/events")
+async def get_task_events(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await _get_task_or_404(task_id, db)
+    return {
+        "task_id": task.task_id,
+        "items": _task_events(task),
+    }
+
+
+@router.get("/{task_id}")
+async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await _get_task_or_404(task_id, db)
     return {
         **_task_to_event(task),
         "task_type": task.task_type,

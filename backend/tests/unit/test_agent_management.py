@@ -1,7 +1,6 @@
 """Unit tests for Agent Management Module."""
 import pytest
-from unittest.mock import MagicMock, patch
-from dataclasses import dataclass
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.ai.engine import AIEngine, ModelConfig
 from app.services.ai.agent_resolver import (
@@ -34,10 +33,177 @@ class TestAgentModel:
         expected = {
             "id", "name", "description", "stage_type",
             "skill_type", "skill_name", "model_id",
+            "instructions", "skills", "mcp_tools", "guardrails",
             "skill_config", "model_config", "policy_config",
             "enabled", "is_system", "created_at", "updated_at",
         }
         assert expected.issubset(columns), f"Missing: {expected - columns}"
+
+
+# ── Agent API Update Tests ─────────────────────────────────────────────────
+
+class TestAgentApiUpdate:
+    """Regression tests for agent update rules."""
+
+    @pytest.mark.asyncio
+    async def test_system_agent_can_update_model_without_changing_bound_fields(self):
+        from app.api.v1.endpoints.agents import AgentUpdate, update_agent
+
+        agent = MagicMock()
+        agent.id = 1
+        agent.name = "System CR"
+        agent.description = "system agent"
+        agent.stage_type = "code_review"
+        agent.skill_type = "builtin"
+        agent.skill_name = "code_review"
+        agent.model_id = None
+        agent.skill_config = {}
+        agent.model_config = {}
+        agent.policy_config = {}
+        agent.enabled = True
+        agent.is_system = True
+        agent.created_at = None
+        agent.updated_at = None
+
+        model = MagicMock()
+        model.id = 42
+        model.name = "deepseek-v4-flash"
+
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+        model_result = MagicMock()
+        model_result.scalar_one_or_none.return_value = model
+
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=[agent_result, model_result])
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        payload = AgentUpdate(
+            stage_type="code_review",
+            skill_name="code_review",
+            model_id=42,
+        )
+
+        result = await update_agent(1, payload, db)
+
+        assert result["id"] == 1
+        assert result["stage_type"] == "code_review"
+        assert result["skill_name"] == "code_review"
+        assert result["model_id"] == 42
+        assert agent.model_id == 42
+
+    @pytest.mark.asyncio
+    async def test_system_agent_can_clear_model_binding(self):
+        from app.api.v1.endpoints.agents import AgentUpdate, update_agent
+
+        agent = MagicMock()
+        agent.id = 1
+        agent.name = "System CR"
+        agent.description = "system agent"
+        agent.stage_type = "code_review"
+        agent.skill_type = "builtin"
+        agent.skill_name = "code_review"
+        agent.model_id = 42
+        agent.instructions = None
+        agent.skills = [{"name": "code_review", "version": "1.0.0", "config": {}}]
+        agent.mcp_tools = []
+        agent.guardrails = {}
+        agent.skill_config = {}
+        agent.model_config = {}
+        agent.policy_config = {}
+        agent.enabled = True
+        agent.is_system = True
+        agent.created_at = None
+        agent.updated_at = None
+
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=[agent_result])
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        payload = AgentUpdate(model_id=None)
+        result = await update_agent(1, payload, db)
+
+        assert result["model_id"] is None
+        assert agent.model_id is None
+
+    @pytest.mark.asyncio
+    async def test_system_agent_rejects_stage_type_change(self):
+        from fastapi import HTTPException
+        from app.api.v1.endpoints.agents import AgentUpdate, update_agent
+
+        agent = MagicMock()
+        agent.id = 1
+        agent.name = "System CR"
+        agent.description = "system agent"
+        agent.stage_type = "code_review"
+        agent.skill_type = "builtin"
+        agent.skill_name = "code_review"
+        agent.model_id = None
+        agent.skill_config = {}
+        agent.model_config = {}
+        agent.policy_config = {}
+        agent.enabled = True
+        agent.is_system = True
+        agent.created_at = None
+        agent.updated_at = None
+
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=[agent_result])
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        payload = AgentUpdate(stage_type="generator")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await update_agent(1, payload, db)
+
+        assert exc_info.value.status_code == 403
+        assert "stage_type of system agent" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_system_agent_rejects_skill_name_change(self):
+        from fastapi import HTTPException
+        from app.api.v1.endpoints.agents import AgentUpdate, update_agent
+
+        agent = MagicMock()
+        agent.id = 1
+        agent.name = "System CR"
+        agent.description = "system agent"
+        agent.stage_type = "code_review"
+        agent.skill_type = "builtin"
+        agent.skill_name = "code_review"
+        agent.model_id = None
+        agent.skill_config = {}
+        agent.model_config = {}
+        agent.policy_config = {}
+        agent.enabled = True
+        agent.is_system = True
+        agent.created_at = None
+        agent.updated_at = None
+
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=[agent_result])
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock()
+
+        payload = AgentUpdate(stage_type="code_review", skill_name="custom_review")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await update_agent(1, payload, db)
+
+        assert exc_info.value.status_code == 403
+        assert "skill_name of system agent" in exc_info.value.detail
 
 
 # ── AgentResolver Tests ─────────────────────────────────────────────────────
@@ -70,6 +236,23 @@ class TestAgentResolver:
             _fallback_engine=fallback,
         )
         assert resolver.get_engine("code_review") is fallback
+
+    def test_get_skill_type_returns_binding_or_builtin_default(self):
+        resolver = AgentResolver(
+            _bindings={
+                "generator": AgentBinding(
+                    agent_id=2,
+                    agent_name="External Gen",
+                    stage_type="generator",
+                    skill_name="org.python_unit_test",
+                    skill_type="skillshub",
+                ),
+            },
+            _engines_by_id={},
+        )
+
+        assert resolver.get_skill_type("generator") == "skillshub"
+        assert resolver.get_skill_type("code_review") == "builtin"
 
     def test_get_engine_falls_back_when_model_not_found(self):
         fallback = _make_engine("gpt-4o-mini")
@@ -370,6 +553,51 @@ class TestSkillMetadata:
         assert "quality_scorer" in values
         assert "change_intelligence" in values
 
+    @pytest.mark.asyncio
+    async def test_agent_skill_catalog_includes_internal_stage_skills(self):
+        from app.api.v1.endpoints.agents import list_agent_skills
+
+        skills = await list_agent_skills()
+        names = {s["name"] for s in skills}
+
+        assert "validate_repair" in names
+        assert "quality_scorer" in names
+
+    @pytest.mark.asyncio
+    async def test_validate_system_internal_agent_is_valid(self):
+        from app.api.v1.endpoints.agents import validate_agent
+
+        agent = MagicMock()
+        agent.id = 5
+        agent.name = "默认验证修复"
+        agent.description = "system agent"
+        agent.stage_type = "validate_repair"
+        agent.skill_type = "builtin"
+        agent.skill_name = "validate_repair"
+        agent.model_id = None
+        agent.instructions = None
+        agent.skills = [{"name": "validate_repair", "version": "1.0.0", "config": {}}]
+        agent.mcp_tools = []
+        agent.guardrails = {}
+        agent.skill_config = {}
+        agent.model_config = {}
+        agent.policy_config = {}
+        agent.enabled = True
+        agent.is_system = True
+        agent.created_at = None
+        agent.updated_at = None
+
+        agent_result = MagicMock()
+        agent_result.scalar_one_or_none.return_value = agent
+
+        db = MagicMock()
+        db.execute = AsyncMock(side_effect=[agent_result])
+
+        result = await validate_agent(5, db)
+
+        assert result["valid"] is True
+        assert result["errors"] == []
+
 
 # ── Pipeline Integration Tests ──────────────────────────────────────────────
 
@@ -380,6 +608,56 @@ class TestPipelineAgentIntegration:
         from app.services.agents.test_manager import PipelineContext
         ctx = PipelineContext()
         assert ctx.agent_resolver is None
+
+    def test_unit_test_engine_exports_public_stage_result_schema(self):
+        from app.services.unit_test_engine import StageResult, UnitTestWorkflow
+        from app.services.agents.test_manager import TestManagerAgent
+
+        result = StageResult(
+            status="failed",
+            reason="generator produced no files",
+            metrics={"duration_ms": 12},
+            events=[{"type": "stage_failed"}],
+        )
+
+        assert result.status == "failed"
+        assert result.events[0]["type"] == "stage_failed"
+        assert issubclass(TestManagerAgent, UnitTestWorkflow)
+
+    @pytest.mark.asyncio
+    async def test_record_stage_result_normalizes_gated_to_skipped(self, monkeypatch):
+        from app.services.agents.test_manager import PipelineContext, TestManagerAgent
+        from app.services.unit_test_engine import StageResult
+
+        async def noop_run_in_executor(*args, **kwargs):
+            return None
+
+        manager = TestManagerAgent()
+        manager._loop = MagicMock()
+        manager._loop.run_in_executor = AsyncMock(side_effect=noop_run_in_executor)
+        ctx = PipelineContext(task_id="task-1")
+
+        await manager._record_stage_result(ctx, "change_intelligence", StageResult(status="gated"))
+
+        assert ctx.output_data["stage_results"][0]["status"] == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_block_remaining_records_each_downstream_stage_result(self):
+        from app.services.agents.test_manager import PipelineContext, TestManagerAgent
+
+        async def noop_run_in_executor(*args, **kwargs):
+            return None
+
+        manager = TestManagerAgent()
+        manager._loop = MagicMock()
+        manager._loop.run_in_executor = AsyncMock(side_effect=noop_run_in_executor)
+        ctx = PipelineContext(task_id="task-1")
+
+        await manager._block_remaining(ctx, "generator", "failed", "no files generated")
+
+        stages = [item["stage"] for item in ctx.output_data["stage_results"]]
+        assert stages == ["validate_repair", "quality_scorer", "mr_feedback"]
+        assert all(item["status"] == "blocked" for item in ctx.output_data["stage_results"])
 
     def test_pipeline_context_can_set_agent_resolver(self):
         from app.services.agents.test_manager import PipelineContext
