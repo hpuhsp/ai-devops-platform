@@ -3,6 +3,7 @@
 from .schemas import Stage, StageResult, WorkflowContext, WorkflowResult
 from .ports import InMemoryWorkflowPorts, WorkflowPorts
 from .platform_ports import PlatformWorkflowPorts
+from .agentic import ManagerDecision, ManagerDecisionEngine, ManagerFallbackPolicy
 
 
 def __getattr__(name: str):
@@ -18,6 +19,9 @@ def __getattr__(name: str):
 __all__ = [
     "PipelineContext",
     "InMemoryWorkflowPorts",
+    "ManagerDecision",
+    "ManagerDecisionEngine",
+    "ManagerFallbackPolicy",
     "PlatformWorkflowPorts",
     "Stage",
     "StageResult",

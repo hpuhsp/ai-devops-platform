@@ -446,48 +446,26 @@ class TestManagerPipelineTerminalBehavior:
     def test_failed_stage_blocks_remaining_nodes(self):
         from app.services.agents.test_manager import (
             PipelineContext,
-            StageResult,
             TestManagerAgent,
         )
 
         mgr = TestManagerAgent()
-        calls = []
 
         async def fake_persist(ctx, key, val):
             ctx.output_data[key] = val
 
-        async def ok_stage(ctx):
-            calls.append("code_review")
-            await fake_persist(ctx, "code_review", {"score": 100, "findings": []})
-            return StageResult(status="success")
-
-        async def failed_generator(ctx):
-            calls.append("generator")
-            await fake_persist(ctx, "test_generation", {
-                "status": "failed",
-                "reason": "no files generated",
-            })
-            return StageResult(status="failed", output={"reason": "no files generated"})
-
-        async def should_not_run(ctx):
-            calls.append("quality_scorer")
-            return StageResult(status="success")
-
         mgr._persist = fake_persist
-        mgr._stages = [
-            ("code_review", ok_stage),
-            ("generator", failed_generator),
-            ("quality_scorer", should_not_run),
-            ("mr_feedback", should_not_run),
-        ]
-
         cb = AsyncMock()
         ctx = PipelineContext(task_id="task-1", status_callback=cb)
-        result = asyncio.run(mgr.run(ctx))
 
-        assert calls == ["code_review", "generator"]
-        assert result["output_data"]["pipeline_status"]["status"] == "failed"
-        assert result["output_data"]["pipeline_status"]["failed_stage"] == "generator"
-        assert result["output_data"]["quality_score"]["status"] == "blocked"
-        assert result["output_data"]["auto_merge"]["status"] == "blocked"
+        async def run_failure_flow():
+            await mgr._mark_pipeline_failed(ctx, "generator", "failed", "no files generated")
+            await mgr._block_remaining(ctx, "generator", "failed", "no files generated")
+
+        asyncio.run(run_failure_flow())
+
+        assert ctx.output_data["pipeline_status"]["status"] == "failed"
+        assert ctx.output_data["pipeline_status"]["failed_stage"] == "generator"
+        assert ctx.output_data["quality_score"]["status"] == "blocked"
+        assert ctx.output_data["auto_merge"]["status"] == "blocked"
         cb.assert_any_call(TaskStatus.FAILED)

@@ -48,13 +48,6 @@ class AgentBinding:
     skill_name: str
     skill_type: str = "builtin"
     model_id: Optional[int] = None
-    instructions: Optional[str] = None
-    skills: list[dict] = field(default_factory=list)
-    mcp_tools: list[dict] = field(default_factory=list)
-    guardrails: dict = field(default_factory=dict)
-    skill_config: dict = field(default_factory=dict)
-    model_config: dict = field(default_factory=dict)
-    policy_config: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -89,21 +82,6 @@ class AgentResolver:
             )
         return self._fallback_engine
 
-    def get_skill_config(self, stage_type: str) -> dict:
-        """Return merged skill config for a stage."""
-        binding = self._bindings.get(stage_type)
-        return binding.skill_config if binding else {}
-
-    def get_model_config(self, stage_type: str) -> dict:
-        """Return model config overrides for a stage."""
-        binding = self._bindings.get(stage_type)
-        return binding.model_config if binding else {}
-
-    def get_policy_config(self, stage_type: str) -> dict:
-        """Return policy config for a stage (max_retry, require_review, etc.)."""
-        binding = self._bindings.get(stage_type)
-        return binding.policy_config if binding else {}
-
     def get_skill_name(self, stage_type: str) -> Optional[str]:
         """Return the skill_name override for a stage, or None to use default."""
         binding = self._bindings.get(stage_type)
@@ -113,16 +91,6 @@ class AgentResolver:
         """Return configured skill type for a stage."""
         binding = self._bindings.get(stage_type)
         return binding.skill_type if binding else "builtin"
-
-    def get_skills(self, stage_type: str) -> list[dict]:
-        """Return configured skills for a stage."""
-        binding = self._bindings.get(stage_type)
-        return binding.skills if binding else []
-
-    def get_guardrails(self, stage_type: str) -> dict:
-        """Return guardrails for a stage."""
-        binding = self._bindings.get(stage_type)
-        return binding.guardrails if binding else {}
 
     def get_model_usage(self) -> dict[str, str]:
         """Return {stage_type: model_label} for all bound stages."""
@@ -149,18 +117,9 @@ class AgentResolver:
                 "agent_name": binding.agent_name,
                 "skill_type": binding.skill_type,
                 "skill_name": binding.skill_name,
-                "skills": binding.skills,
-                "mcp_tools": binding.mcp_tools,
                 "model": model_label,
             })
         return summaries
-
-
-def _skills_for_agent(agent) -> list[dict]:
-    skills = getattr(agent, "skills", None) or []
-    if skills:
-        return skills
-    return [{"name": agent.skill_name, "version": "1.0.0", "config": {}}]
 
 
 def _binding_from_agent(agent, stage_type: str | None = None) -> AgentBinding:
@@ -171,13 +130,6 @@ def _binding_from_agent(agent, stage_type: str | None = None) -> AgentBinding:
         skill_type=getattr(agent, "skill_type", None) or "builtin",
         skill_name=agent.skill_name,
         model_id=agent.model_id,
-        instructions=getattr(agent, "instructions", None),
-        skills=_skills_for_agent(agent),
-        mcp_tools=getattr(agent, "mcp_tools", None) or [],
-        guardrails=getattr(agent, "guardrails", None) or {},
-        skill_config=agent.skill_config or {},
-        model_config=agent.model_config or {},
-        policy_config=agent.policy_config or {},
     )
 
 

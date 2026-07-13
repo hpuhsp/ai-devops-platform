@@ -9,7 +9,7 @@ import httpx
 
 from app.core.database import get_db
 from app.core.security import encrypt, decrypt
-from app.models import AIModel, Repository, NotifyConfig, NotificationLog, NotificationPolicy
+from app.models import AIModel, Repository, NotifyConfig, NotificationLog
 from app.services.git.webhook_parser import _normalize_url
 
 router = APIRouter()
@@ -450,11 +450,6 @@ async def delete_notify(nc_id: int, db: AsyncSession = Depends(get_db)):
     await db.execute(
         update(NotificationLog)
         .where(NotificationLog.notify_config_id == nc_id)
-        .values(notify_config_id=None)
-    )
-    await db.execute(
-        update(NotificationPolicy)
-        .where(NotificationPolicy.notify_config_id == nc_id)
         .values(notify_config_id=None)
     )
 

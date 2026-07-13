@@ -33,8 +33,6 @@ class TestAgentModel:
         expected = {
             "id", "name", "description", "stage_type",
             "skill_type", "skill_name", "model_id",
-            "instructions", "skills", "mcp_tools", "guardrails",
-            "skill_config", "model_config", "policy_config",
             "enabled", "is_system", "created_at", "updated_at",
         }
         assert expected.issubset(columns), f"Missing: {expected - columns}"
@@ -57,9 +55,6 @@ class TestAgentApiUpdate:
         agent.skill_type = "builtin"
         agent.skill_name = "code_review"
         agent.model_id = None
-        agent.skill_config = {}
-        agent.model_config = {}
-        agent.policy_config = {}
         agent.enabled = True
         agent.is_system = True
         agent.created_at = None
@@ -105,12 +100,7 @@ class TestAgentApiUpdate:
         agent.skill_type = "builtin"
         agent.skill_name = "code_review"
         agent.model_id = 42
-        agent.instructions = None
-        agent.skills = [{"name": "code_review", "version": "1.0.0", "config": {}}]
-        agent.mcp_tools = []
-        agent.guardrails = {}
         agent.skill_config = {}
-        agent.model_config = {}
         agent.policy_config = {}
         agent.enabled = True
         agent.is_system = True
@@ -144,9 +134,6 @@ class TestAgentApiUpdate:
         agent.skill_type = "builtin"
         agent.skill_name = "code_review"
         agent.model_id = None
-        agent.skill_config = {}
-        agent.model_config = {}
-        agent.policy_config = {}
         agent.enabled = True
         agent.is_system = True
         agent.created_at = None
@@ -181,9 +168,6 @@ class TestAgentApiUpdate:
         agent.skill_type = "builtin"
         agent.skill_name = "code_review"
         agent.model_id = None
-        agent.skill_config = {}
-        agent.model_config = {}
-        agent.policy_config = {}
         agent.enabled = True
         agent.is_system = True
         agent.created_at = None
@@ -282,57 +266,6 @@ class TestAgentResolver:
         )
         assert resolver.get_engine("code_review") is fallback
 
-    def test_get_skill_config(self):
-        resolver = AgentResolver(
-            _bindings={
-                "code_review": AgentBinding(
-                    agent_id=1, agent_name="CR Agent", stage_type="code_review",
-                    skill_name="code_review", model_id=None,
-                    skill_config={"max_diff_lines": 500},
-                ),
-            },
-            _engines_by_id={},
-        )
-        assert resolver.get_skill_config("code_review") == {"max_diff_lines": 500}
-
-    def test_get_skill_config_empty_when_no_binding(self):
-        resolver = AgentResolver(_bindings={})
-        assert resolver.get_skill_config("code_review") == {}
-
-    def test_get_model_config(self):
-        resolver = AgentResolver(
-            _bindings={
-                "generator": AgentBinding(
-                    agent_id=2, agent_name="Gen Agent", stage_type="generator",
-                    skill_name="test_generation", model_id=1,
-                    model_config={"temperature": 0.3, "max_tokens": 8192},
-                ),
-            },
-            _engines_by_id={},
-        )
-        cfg = resolver.get_model_config("generator")
-        assert cfg["temperature"] == 0.3
-        assert cfg["max_tokens"] == 8192
-
-    def test_get_policy_config(self):
-        resolver = AgentResolver(
-            _bindings={
-                "validate_repair": AgentBinding(
-                    agent_id=3, agent_name="Repair Agent", stage_type="validate_repair",
-                    skill_name="validate_repair", model_id=None,
-                    policy_config={"max_retry": 5, "require_review": True},
-                ),
-            },
-            _engines_by_id={},
-        )
-        policy = resolver.get_policy_config("validate_repair")
-        assert policy["max_retry"] == 5
-        assert policy["require_review"] is True
-
-    def test_get_policy_config_empty_when_no_binding(self):
-        resolver = AgentResolver(_bindings={})
-        assert resolver.get_policy_config("validate_repair") == {}
-
     def test_get_model_usage(self):
         engine_a = _make_engine("claude-3-sonnet")
         fallback = _make_engine("gpt-4o-mini")
@@ -414,9 +347,6 @@ class TestBuildAgentResolverSync:
         mock_agent_1.skill_name = "code_review"
         mock_agent_1.skill_type = "builtin"
         mock_agent_1.model_id = 10
-        mock_agent_1.skill_config = {"max_diff_lines": 500}
-        mock_agent_1.model_config = {}
-        mock_agent_1.policy_config = {}
         mock_agent_1.enabled = True
 
         mock_agent_2 = MagicMock()
@@ -426,9 +356,6 @@ class TestBuildAgentResolverSync:
         mock_agent_2.skill_name = "test_generation"
         mock_agent_2.skill_type = "builtin"
         mock_agent_2.model_id = 20
-        mock_agent_2.skill_config = {}
-        mock_agent_2.model_config = {"temperature": 0.3}
-        mock_agent_2.policy_config = {}
         mock_agent_2.enabled = True
 
         mock_model_10 = MagicMock()
@@ -467,8 +394,6 @@ class TestBuildAgentResolverSync:
         assert resolver is not None
         assert resolver.get_engine("code_review").model_config.model_id == "claude-3-sonnet"
         assert resolver.get_engine("generator").model_config.model_id == "deepseek-chat"
-        assert resolver.get_skill_config("code_review") == {"max_diff_lines": 500}
-        assert resolver.get_model_config("generator") == {"temperature": 0.3}
 
     def test_disabled_agents_are_skipped(self):
         repo = MagicMock()
@@ -575,13 +500,6 @@ class TestSkillMetadata:
         agent.skill_type = "builtin"
         agent.skill_name = "validate_repair"
         agent.model_id = None
-        agent.instructions = None
-        agent.skills = [{"name": "validate_repair", "version": "1.0.0", "config": {}}]
-        agent.mcp_tools = []
-        agent.guardrails = {}
-        agent.skill_config = {}
-        agent.model_config = {}
-        agent.policy_config = {}
         agent.enabled = True
         agent.is_system = True
         agent.created_at = None
@@ -688,7 +606,7 @@ class TestPipelineAgentIntegration:
         )
         manager = TestManagerAgent()
 
-        result = manager._engine_for(ctx, "code_review")
+        result = resolver.get_engine("code_review")
         assert result is agent_engine
 
     def test_engine_for_falls_to_resolver_fallback(self):
@@ -708,7 +626,7 @@ class TestPipelineAgentIntegration:
         )
         manager = TestManagerAgent()
 
-        result = manager._engine_for(ctx, "code_review")
+        result = resolver.get_engine("code_review")
         assert result is fallback
 
     def test_engine_for_falls_to_default_engine(self):
@@ -720,103 +638,16 @@ class TestPipelineAgentIntegration:
         ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        assert manager._engine_for(ctx, "code_review") is fallback
-
-    def test_skill_config_for_with_agent_resolver(self):
-        """_skill_config_for returns agent's skill_config when agent_resolver is set."""
-        from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-
-        resolver = AgentResolver(
-            _bindings={
-                "code_review": AgentBinding(
-                    agent_id=1, agent_name="CR", stage_type="code_review",
-                    skill_name="code_review", model_id=None,
-                    skill_config={"max_diff_lines": 1000, "custom_prompt": "focus on security"},
-                ),
-            },
-            _engines_by_id={},
-        )
-
-        ctx = PipelineContext(agent_resolver=resolver)
-        manager = TestManagerAgent()
-
-        cfg = manager._skill_config_for(ctx, "code_review")
-        assert cfg["max_diff_lines"] == 1000
-        assert cfg["custom_prompt"] == "focus on security"
-
-    def test_skill_config_for_falls_to_repo_config(self):
-        """Without agent_resolver, _skill_config_for uses repo skills_config."""
-        from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-
-        ctx = PipelineContext(
-            skills_config={"code_review": {"threshold": 50}},
-        )
-        manager = TestManagerAgent()
-
-        cfg = manager._skill_config_for(ctx, "code_review")
-        assert cfg == {"threshold": 50}
-
-    def test_policy_config_for_with_agent_resolver(self):
-        """_policy_config_for returns agent's policy_config."""
-        from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-
-        resolver = AgentResolver(
-            _bindings={
-                "validate_repair": AgentBinding(
-                    agent_id=3, agent_name="Repair", stage_type="validate_repair",
-                    skill_name="validate_repair", model_id=None,
-                    policy_config={"max_retry": 7, "require_review": False},
-                ),
-            },
-            _engines_by_id={},
-        )
-
-        ctx = PipelineContext(agent_resolver=resolver)
-        manager = TestManagerAgent()
-
-        policy = manager._policy_config_for(ctx, "validate_repair")
-        assert policy["max_retry"] == 7
-        assert policy["require_review"] is False
-
-    def test_policy_config_for_empty_without_resolver(self):
-        from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-
-        ctx = PipelineContext()
-        manager = TestManagerAgent()
-
-        assert manager._policy_config_for(ctx, "validate_repair") == {}
+        assert resolver.get_engine("code_review") is fallback
 
     def test_stage_to_type_mapping(self):
         """Verify the _STAGE_TO_TYPE mapping covers all skill-using stages."""
         from app.services.agents.test_manager import TestManagerAgent
 
         expected = {
-            "code_review": "code_review",
             "change_intelligence": "change_intelligence",
             "generator": "generator",
             "validate_repair": "validate_repair",
             "quality_scorer": "quality_scorer",
         }
         assert TestManagerAgent._STAGE_TO_TYPE == expected
-
-    def test_get_model_config_for_with_agent(self):
-        """_model_config_for returns agent's model_config."""
-        from app.services.agents.test_manager import TestManagerAgent, PipelineContext
-
-        resolver = AgentResolver(
-            _bindings={
-                "generator": AgentBinding(
-                    agent_id=2, agent_name="Gen", stage_type="generator",
-                    skill_name="test_generation", model_id=1,
-                    model_config={"temperature": 0.7, "max_tokens": 4096},
-                ),
-            },
-            _engines_by_id={},
-        )
-
-        ctx = PipelineContext(agent_resolver=resolver)
-        manager = TestManagerAgent()
-
-        cfg = manager._model_config_for(ctx, "generator")
-        assert cfg["temperature"] == 0.7
-        assert cfg["max_tokens"] == 4096

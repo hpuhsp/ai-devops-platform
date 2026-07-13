@@ -15,14 +15,6 @@ class Agent(Base):
     skill_name = Column(String(100), nullable=False)
     model_id = Column(Integer, ForeignKey("ai_models.id"), nullable=True)
 
-    instructions = Column(Text)
-    skills = Column(JSONB, default=list)
-    mcp_tools = Column(JSONB, default=list)
-    guardrails = Column(JSONB, default=dict)
-    skill_config = Column(JSONB, default=dict)
-    model_config = Column(JSONB, default=dict)
-    policy_config = Column(JSONB, default=dict)
-
     enabled = Column(Boolean, default=True)
     is_system = Column(Boolean, default=False)
 

@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Card, Descriptions, Tag, Spin, Alert, Typography, Collapse, Badge,
-  Row, Col, Statistic, Progress, Divider,
+  Row, Col, Statistic, Progress, Divider, Timeline,
 } from 'antd'
 import {
   CheckCircleOutlined, CloseCircleOutlined, ExperimentOutlined,
   MergeCellsOutlined, CodeOutlined, BulbOutlined, TrophyOutlined,
   WarningOutlined, FileTextOutlined, BugOutlined,
+  RobotOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { getTask } from '../../services/api'
@@ -262,6 +263,74 @@ function ContextPanel({ data }: { data: any }) {
   )
 }
 
+function ManagerTracePanel({ data }: { data: any[] }) {
+  const trace = Array.isArray(data) ? data : []
+  if (trace.length === 0) {
+    return <Text type="secondary">暂无 Manager 决策轨迹</Text>
+  }
+
+  const sourceColor: Record<string, string> = {
+    llm: 'blue',
+    fallback: 'orange',
+  }
+
+  return (
+    <Timeline
+      items={trace.map((item: any, index: number) => {
+        const action = item.action || 'unknown'
+        const source = item.source || 'unknown'
+        const promptTokens = item.prompt_tokens ?? 0
+        const completionTokens = item.completion_tokens ?? 0
+        const inputs = item.inputs && Object.keys(item.inputs).length > 0
+          ? JSON.stringify(item.inputs, null, 2)
+          : ''
+
+        return {
+          color: source === 'fallback' ? 'orange' : 'blue',
+          children: (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <Tag color="geekblue">Round {item.round ?? index + 1}</Tag>
+                <Tag color={sourceColor[source] || 'default'}>{source}</Tag>
+                <Text strong>{action}</Text>
+                {(promptTokens > 0 || completionTokens > 0) && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    prompt {promptTokens} / completion {completionTokens}
+                  </Text>
+                )}
+              </div>
+              {item.reason && (
+                <Paragraph style={{ margin: '6px 0 0 0' }}>{item.reason}</Paragraph>
+              )}
+              {item.expected_outcome && (
+                <Paragraph type="secondary" style={{ margin: '4px 0 0 0', fontSize: 12 }}>
+                  预期结果：{item.expected_outcome}
+                </Paragraph>
+              )}
+              {inputs && (
+                <Collapse
+                  size="small"
+                  ghost
+                  style={{ marginTop: 4 }}
+                  items={[{
+                    key: 'inputs',
+                    label: '决策输入',
+                    children: (
+                      <pre style={{ fontSize: 11, margin: 0, maxHeight: 180, overflow: 'auto' }}>
+                        {inputs}
+                      </pre>
+                    ),
+                  }]}
+                />
+              )}
+            </div>
+          ),
+        }
+      })}
+    />
+  )
+}
+
 function AutoMergePanel({ data }: { data: any }) {
   if (!data) return <Text type="secondary">本次未触发智能合并</Text>
   return (
@@ -333,6 +402,21 @@ export default function TaskDetailPage() {
       <Collapse
         defaultActiveKey={['cr']}
         items={[
+          {
+            key: 'mt',
+            label: (
+              <span>
+                <RobotOutlined style={{ marginRight: 8, color: '#1677ff' }} />
+                TestManager 决策轨迹
+                {Array.isArray(od.manager_trace) && (
+                  <Tag color="blue" style={{ marginLeft: 8 }}>
+                    {od.manager_trace.length} 轮
+                  </Tag>
+                )}
+              </span>
+            ),
+            children: <ManagerTracePanel data={od.manager_trace} />,
+          },
           {
             key: 'ctx',
             label: (

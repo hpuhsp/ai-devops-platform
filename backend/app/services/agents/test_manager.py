@@ -39,6 +39,7 @@ except ModuleNotFoundError:
     structlog = _StructlogFallback()
 
 from app.services.unit_test_engine.schemas import StageResult
+from app.services.unit_test_engine.agentic import ManagerDecision, ManagerDecisionEngine
 
 logger = structlog.get_logger()
 
@@ -106,13 +107,13 @@ class PipelineContext:
 class UnitTestWorkflow:
     """
     State-machine pipeline orchestrator.
-    Drives Agent chain: code_review → change_intelligence → context → generator
-    → validator/repair → quality_scorer → mr_feedback
+    Drives the unit-test Agent chain: change_intelligence → context → generator
+    → validator/repair → quality_scorer → mr_feedback.
+    Outer pipeline stages such as code review run before this workflow.
     """
 
     # Pipeline stage_name → Agent stage_type
     _STAGE_TO_TYPE = {
-        "code_review": "code_review",
         "change_intelligence": "change_intelligence",
         "generator": "generator",
         "validate_repair": "validate_repair",
@@ -120,7 +121,6 @@ class UnitTestWorkflow:
     }
 
     _STAGE_OUTPUT_KEYS = {
-        "code_review": "code_review",
         "change_intelligence": "change_intelligence",
         "context": "context",
         "generator": "test_generation",
@@ -131,9 +131,17 @@ class UnitTestWorkflow:
 
     _TERMINAL_FAILURES = {"failed", "blocked"}
 
+    _ACTION_TO_STAGE = {
+        "analyze_change": "change_intelligence",
+        "build_context": "context",
+        "generate_tests": "generator",
+        "validate_tests": "validate_repair",
+        "score_quality": "quality_scorer",
+        "publish_feedback": "mr_feedback",
+    }
+
     def __init__(self):
         self._stages = [
-            ("code_review", self._stage_code_review),
             ("change_intelligence", self._stage_change_intelligence),
             ("context", self._stage_context),
             ("generator", self._stage_generator),
@@ -143,21 +151,60 @@ class UnitTestWorkflow:
         ]
 
     async def run(self, ctx: PipelineContext) -> dict:
-        """Execute pipeline stages sequentially. Returns final output dict."""
+        """Execute an agentic observe-decide-act loop.
+
+        The manager LLM selects one safe action per round. Existing stage
+        implementations remain as controlled action executors, so the platform
+        keeps deterministic side effects, status records, and dashboard outputs.
+        """
         self._loop = asyncio.get_event_loop()
         if ctx.ports is None:
             from app.services.unit_test_engine.platform_ports import PlatformWorkflowPorts
 
             ctx.ports = PlatformWorkflowPorts(self._loop)
 
-        for stage_name, stage_fn in self._stages:
+        decision_engine = ManagerDecisionEngine()
+        executed_actions: set[str] = set()
+        max_rounds = self._manager_max_rounds(ctx)
+        terminal = False
+
+        for round_number in range(1, max_rounds + 1):
             try:
+                decision, pt, ct = await decision_engine.decide(ctx, round_number, executed_actions)
+                ctx.prompt_tokens += pt
+                ctx.completion_tokens += ct
+                await self._record_manager_decision(ctx, decision, round_number, pt, ct)
+
+                if decision.action == "finish":
+                    await self._persist(ctx, "pipeline_status", {
+                        "status": "success",
+                        "reason": decision.reason,
+                        "round": round_number,
+                    })
+                    terminal = True
+                    break
+
+                if decision.action == "fail":
+                    await self._mark_pipeline_failed(ctx, "test_manager", "failed", decision.reason)
+                    terminal = True
+                    break
+
+                stage_name = self._ACTION_TO_STAGE[decision.action]
                 await self._emit_status(ctx, stage_name)
-                result = await stage_fn(ctx)
+                result = await self._execute_manager_action(ctx, decision)
                 ctx.prompt_tokens += result.prompt_tokens
                 ctx.completion_tokens += result.completion_tokens
                 await self._record_stage_result(ctx, stage_name, result)
-                logger.info("pipeline.stage_done", stage=stage_name, status=result.status)
+                await self._record(ctx, "test_manager", result.status,
+                                   input_data=decision.as_trace(round_number),
+                                   output_data={"stage": stage_name, **result.output},
+                                   pt=pt + result.prompt_tokens,
+                                   ct=ct + result.completion_tokens,
+                                   duration_ms=result.duration_ms,
+                                   round_number=round_number)
+                executed_actions.add(decision.action)
+                logger.info("pipeline.action_done", action=decision.action,
+                            stage=stage_name, status=result.status)
 
                 # Gate: if change_intelligence says no test needed, skip remaining
                 if stage_name == "change_intelligence" and result.status == "gated":
@@ -166,20 +213,30 @@ class UnitTestWorkflow:
                         "terminal_stage": stage_name,
                         "reason": result.output.get("reason") or result.output.get("skip_reason"),
                     })
+                    terminal = True
                     break
 
                 if result.status in self._TERMINAL_FAILURES:
                     reason = self._stage_reason(result, stage_name)
                     await self._mark_pipeline_failed(ctx, stage_name, result.status, reason)
                     await self._block_remaining(ctx, stage_name, result.status, reason)
+                    terminal = True
                     break
 
             except Exception as exc:
-                logger.exception("pipeline.stage_error", stage=stage_name, error=str(exc))
-                await self._persist(ctx, stage_name, {"status": "failed", "error": str(exc)})
-                await self._mark_pipeline_failed(ctx, stage_name, "failed", str(exc))
-                await self._block_remaining(ctx, stage_name, "failed", str(exc))
+                logger.exception("pipeline.manager_error", error=str(exc))
+                await self._persist(ctx, "test_manager", {"status": "failed", "error": str(exc)})
+                await self._mark_pipeline_failed(ctx, "test_manager", "failed", str(exc))
+                terminal = True
                 break
+
+        if not terminal and "pipeline_status" not in ctx.output_data:
+            await self._mark_pipeline_failed(
+                ctx,
+                "test_manager",
+                "failed",
+                f"manager max rounds exhausted: {max_rounds}",
+            )
 
         if "pipeline_status" not in ctx.output_data:
             await self._persist(ctx, "pipeline_status", {"status": "success"})
@@ -194,11 +251,66 @@ class UnitTestWorkflow:
             "completion_tokens": ctx.completion_tokens,
         }
 
+    def _manager_max_rounds(self, ctx: PipelineContext) -> int:
+        agents_cfg = ctx.skills_config.get("agents", {}) if isinstance(ctx.skills_config, dict) else {}
+        try:
+            return max(1, min(int(agents_cfg.get("max_manager_rounds", 8)), 20))
+        except (TypeError, ValueError):
+            return 8
+
+    async def _record_manager_decision(
+        self,
+        ctx: PipelineContext,
+        decision: ManagerDecision,
+        round_number: int,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ):
+        trace = decision.as_trace(round_number)
+        trace["prompt_tokens"] = prompt_tokens
+        trace["completion_tokens"] = completion_tokens
+        ctx.output_data.setdefault("manager_trace", [])
+        ctx.output_data["manager_trace"].append(trace)
+        await self._persist(ctx, "manager_trace", ctx.output_data["manager_trace"])
+        ctx.output_data.setdefault("events", [])
+        ctx.output_data["events"].append({
+            "type": "manager_decision",
+            "stage": "test_manager",
+            "round": round_number,
+            "action": decision.action,
+            "reason": decision.reason,
+            "source": decision.source,
+        })
+        await self._persist(ctx, "events", ctx.output_data["events"])
+
+    async def _execute_manager_action(
+        self,
+        ctx: PipelineContext,
+        decision: ManagerDecision,
+    ) -> StageResult:
+        actions = {
+            "analyze_change": self._stage_change_intelligence,
+            "build_context": self._stage_context,
+            "generate_tests": self._stage_generator,
+            "validate_tests": self._stage_validate_repair,
+            "score_quality": self._stage_quality_scorer,
+            "publish_feedback": self._stage_mr_feedback,
+        }
+        action = actions.get(decision.action)
+        if not action:
+            return StageResult(
+                status="failed",
+                reason=f"unsupported manager action: {decision.action}",
+                output={"status": "failed", "reason": "unsupported manager action"},
+            )
+        return await action(ctx)
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    async def _persist(self, ctx: PipelineContext, key: str, val: dict):
+    async def _persist(self, ctx: PipelineContext, key: str, val: dict | list):
         ctx.output_data[key] = val
-        await ctx.ports.persist(ctx, key, val)
+        if ctx.ports:
+            await ctx.ports.persist(ctx, key, val)
 
     def _stage_reason(self, result: StageResult, stage_name: str) -> str:
         return (
@@ -313,30 +425,6 @@ class UnitTestWorkflow:
         # Should never reach here — agent_resolver is always built
         return ctx.engine
 
-    def _skill_config_for(self, ctx: PipelineContext, stage_name: str) -> dict:
-        """Return merged skill config for a stage (agent config overrides repo config)."""
-        if ctx.agent_resolver:
-            stage_type = self._STAGE_TO_TYPE.get(stage_name)
-            if stage_type:
-                return ctx.agent_resolver.get_skill_config(stage_type)
-        return ctx.skills_config.get(stage_name, {})
-
-    def _model_config_for(self, ctx: PipelineContext, stage_name: str) -> dict:
-        """Return model config overrides for a stage from agent binding."""
-        if ctx.agent_resolver:
-            stage_type = self._STAGE_TO_TYPE.get(stage_name)
-            if stage_type:
-                return ctx.agent_resolver.get_model_config(stage_type)
-        return {}
-
-    def _policy_config_for(self, ctx: PipelineContext, stage_name: str) -> dict:
-        """Return policy config for a stage from agent binding."""
-        if ctx.agent_resolver:
-            stage_type = self._STAGE_TO_TYPE.get(stage_name)
-            if stage_type:
-                return ctx.agent_resolver.get_policy_config(stage_type)
-        return {}
-
     async def _skill_name_for(self, ctx: PipelineContext, stage_type: str, default_name: str) -> str:
         """Resolve skill name for a stage from AgentResolver, with hardcoded fallback."""
         if ctx.agent_resolver:
@@ -362,45 +450,6 @@ class UnitTestWorkflow:
 
     # ── Stage Implementations ────────────────────────────────────────────────
 
-    async def _stage_code_review(self, ctx: PipelineContext) -> StageResult:
-        if "code_review" not in ctx.enabled_stages:
-            await self._persist(ctx, "code_review", {"status": "skipped"})
-            return StageResult(status="skipped")
-
-        from app.services.skills.runtime import skill_runtime
-        engine = self._engine_for(ctx, "code_review")
-        skill_cfg = self._skill_config_for(ctx, "code_review")
-        skill_name = await self._skill_name_for(ctx, "code_review", "code_review")
-        cr = await skill_runtime.execute(
-            skill_name,
-            ctx.skill_context,
-            engine,
-            skill_config=skill_cfg,
-            skill_type=self._skill_type_for(ctx, "code_review"),
-        )
-        status = "success"
-        cr_details = dict(cr.details)
-        if not cr.success:
-            status = "failed"
-            cr_details.setdefault("status", "failed")
-            cr_details.setdefault("reason", cr_details.get("error", "code review failed"))
-        elif cr_details.get("blocked"):
-            status = "blocked"
-            cr_details.setdefault("status", "blocked")
-            cr_details.setdefault("reason", "code review policy blocked this change")
-
-        await self._persist(ctx, "code_review", cr_details)
-
-        for notif in cr.notifications:
-            await self._notify(ctx, notif, "code_review")
-
-        return StageResult(
-            status=status,
-            output=cr_details,
-            prompt_tokens=cr.prompt_tokens,
-            completion_tokens=cr.completion_tokens,
-        )
-
     async def _stage_change_intelligence(self, ctx: PipelineContext) -> StageResult:
         if "test_generation" not in ctx.enabled_stages:
             await self._persist(ctx, "test_generation", {"status": "skipped"})
@@ -409,7 +458,7 @@ class UnitTestWorkflow:
         from app.services.skills.runtime import skill_runtime
         start = time.time()
         engine = self._engine_for(ctx, "change_intelligence")
-        ci_skill_cfg = self._skill_config_for(ctx, "change_intelligence")
+        ci_skill_cfg = ctx.skills_config.get("change_intelligence", {})
         skill_name = await self._skill_name_for(ctx, "change_intelligence", "change_intelligence")
         ci_result = await skill_runtime.execute(
             skill_name,
@@ -501,15 +550,13 @@ class UnitTestWorkflow:
     async def _stage_generator(self, ctx: PipelineContext) -> StageResult:
         from app.services.skills.runtime import skill_runtime
         test_cfg = ctx.skills_config.get("test_generation", {})
-        agent_skill_cfg = self._skill_config_for(ctx, "generator")
-        merged_cfg = {**{k: v for k, v in test_cfg.items() if k != "enabled"}, **agent_skill_cfg}
         engine = self._engine_for(ctx, "generator")
 
         start = time.time()
         skill_name = await self._skill_name_for(ctx, "generator", "test_generation")
         tg = await skill_runtime.execute(
             skill_name, ctx.skill_context, engine,
-            skill_config=merged_cfg,
+            skill_config=test_cfg,
             skill_type=self._skill_type_for(ctx, "generator"),
         )
         ms = int((time.time() - start) * 1000)
@@ -550,11 +597,7 @@ class UnitTestWorkflow:
         repair_enabled = agents_cfg.get("repair_enabled", True)
         repair_engine = self._engine_for(ctx, "validate_repair")
 
-        # Agent policy_config can override max_repair_rounds
-        policy = self._policy_config_for(ctx, "validate_repair")
-        max_repair_rounds = policy.get("max_retry")
-        if max_repair_rounds is None:
-            max_repair_rounds = agents_cfg.get("max_repair_rounds")
+        max_repair_rounds = agents_cfg.get("max_repair_rounds")
 
         if files and cmd:
             wr, repair_history = await _validate_repair_loop(

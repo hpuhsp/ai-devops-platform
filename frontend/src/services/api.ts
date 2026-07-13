@@ -34,7 +34,6 @@ export const deleteAgent = (id: number) => api.delete(`/api/v1/agents/${id}`)
 export const cloneAgent = (id: number) => api.post(`/api/v1/agents/${id}/clone`).then(r => r.data)
 export const listAgentSkills = () => api.get('/api/v1/agents/skills').then(r => r.data)
 export const listAgentStages = () => api.get('/api/v1/agents/stages').then(r => r.data)
-export const listAgentMcpTools = () => api.get('/api/v1/agents/mcp-tools').then(r => r.data)
 export const validateAgent = (id: number) => api.post(`/api/v1/agents/${id}/validate`).then(r => r.data)
 
 // ── Notify Configs ─────────────────────────────────────────────────────

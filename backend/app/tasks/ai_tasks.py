@@ -348,6 +348,107 @@ def process_push_event(self, repo_id: int, event_data: dict):
         raise self.retry(exc=exc, countdown=30)
 
 
+async def _persist_output_key(task_id: str, key: str, value: dict | list):
+    if not task_id:
+        return
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _write_partial_output, task_id, key, value)
+
+
+def _stage_record(stage: str, status: str, output: dict, duration_ms: int = 0,
+                  prompt_tokens: int = 0, completion_tokens: int = 0) -> dict:
+    return {
+        "stage": stage,
+        "status": "skipped" if status == "gated" else status,
+        "reason": output.get("reason") or output.get("error"),
+        "metrics": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "duration_ms": duration_ms,
+        },
+        "artifacts": [],
+    }
+
+
+async def _run_code_review_stage(
+    context,
+    agent_resolver,
+    platform_engine,
+    skills_config: dict,
+    notify_cfg: dict | None,
+    task_id: str,
+) -> dict:
+    """Run the outer code review pipeline stage before unit-test orchestration."""
+    from app.services.skills.runtime import skill_runtime
+
+    start = time.time()
+    engine = agent_resolver.get_engine("code_review") if agent_resolver else platform_engine
+    skill_name = agent_resolver.get_skill_name("code_review") if agent_resolver else None
+    skill_type = agent_resolver.get_skill_type("code_review") if agent_resolver else "builtin"
+    result = await skill_runtime.execute(
+        skill_name or "code_review",
+        context,
+        engine,
+        skill_config=(skills_config or {}).get("code_review", {}),
+        skill_type=skill_type or "builtin",
+    )
+    duration_ms = int((time.time() - start) * 1000)
+
+    details = dict(result.details or {})
+    status = "success"
+    if not result.success:
+        status = "failed"
+        details.setdefault("status", "failed")
+        details.setdefault("reason", details.get("error", "code review failed"))
+    elif result.blocked or details.get("blocked"):
+        status = "blocked"
+        details.setdefault("status", "blocked")
+        details.setdefault("reason", "code review policy blocked this change")
+    else:
+        details.setdefault("status", "success")
+
+    await _persist_output_key(task_id, "code_review", details)
+    if task_id:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            _record_agent_execution,
+            task_id,
+            "code_review",
+            status,
+            {"changed_files": context.changed_files[:20]},
+            details,
+            result.prompt_tokens,
+            result.completion_tokens,
+            duration_ms,
+            1,
+        )
+
+    for notif in result.notifications:
+        await _send_notification(
+            notif,
+            notify_cfg,
+            repo_id=context.repo_id,
+            branch=context.branch,
+            stage_type="code_review",
+        )
+
+    return {
+        "status": status,
+        "output": details,
+        "stage_result": _stage_record(
+            "code_review",
+            status,
+            details,
+            duration_ms,
+            result.prompt_tokens,
+            result.completion_tokens,
+        ),
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+    }
+
+
 async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, notify_cfg: dict | None = None, enabled_stages: list | None = None, status_callback=None) -> dict:
     """Pure async: git diff + AI pipeline orchestration. No DB access."""
     from app.services.ai.engine import build_engine_from_db_model, AIEngine
@@ -395,6 +496,82 @@ async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, not
 
     skills_config = repo.skills_config or {}
 
+    selected_stages = set(enabled_stages or ["code_review"])
+    output_data: dict = {}
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    if "code_review" in selected_stages:
+        if status_callback:
+            try:
+                await status_callback("analyzing")
+            except Exception:
+                pass
+        cr_result = await _run_code_review_stage(
+            context,
+            agent_resolver,
+            platform_engine,
+            skills_config,
+            notify_cfg,
+            task_id,
+        )
+        output_data["code_review"] = cr_result["output"]
+        output_data["stage_results"] = [cr_result["stage_result"]]
+        prompt_tokens += cr_result["prompt_tokens"]
+        completion_tokens += cr_result["completion_tokens"]
+        await _persist_output_key(task_id, "stage_results", output_data["stage_results"])
+
+        if cr_result["status"] in {"failed", "blocked"}:
+            reason = (
+                cr_result["output"].get("reason")
+                or cr_result["output"].get("error")
+                or f"code_review {cr_result['status']}"
+            )
+            pipeline_status = {
+                "status": cr_result["status"],
+                "failed_stage": "code_review",
+                "reason": reason,
+            }
+            output_data["pipeline_status"] = pipeline_status
+            if "test_generation" in selected_stages:
+                blocked = {
+                    "status": "blocked",
+                    "blocked_by": "code_review",
+                    "reason": f"Blocked because code_review {cr_result['status']}: {reason}",
+                }
+                output_data["test_generation"] = blocked
+                output_data["stage_results"].append(_stage_record("test_generation", "blocked", blocked))
+                await _persist_output_key(task_id, "test_generation", blocked)
+                await _persist_output_key(task_id, "stage_results", output_data["stage_results"])
+            await _persist_output_key(task_id, "pipeline_status", pipeline_status)
+            if agent_resolver:
+                output_data["model_usage"] = agent_resolver.get_model_usage()
+            return {
+                "output_data": output_data,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+    else:
+        skipped = {"status": "skipped", "reason": "code_review stage is not enabled"}
+        output_data["code_review"] = skipped
+        output_data["stage_results"] = [_stage_record("code_review", "skipped", skipped)]
+        await _persist_output_key(task_id, "code_review", skipped)
+        await _persist_output_key(task_id, "stage_results", output_data["stage_results"])
+
+    if "test_generation" not in selected_stages:
+        pipeline_status = {"status": "success", "reason": "selected pipeline stages completed"}
+        output_data["pipeline_status"] = pipeline_status
+        await _persist_output_key(task_id, "pipeline_status", pipeline_status)
+        if agent_resolver:
+            output_data["model_usage"] = agent_resolver.get_model_usage()
+        return {
+            "output_data": output_data,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
+
+    context.extra["code_review_result"] = output_data.get("code_review")
+
     pipeline_ctx = PipelineContext(
         repo=repo,
         engine=platform_engine,
@@ -403,11 +580,14 @@ async def _ai_pipeline(repo, platform_model, event_data: dict, task_id: str, not
         skill_context=context,
         event_data=event_data,
         task_id=task_id,
-        enabled_stages=set(enabled_stages or ["code_review"]),
+        enabled_stages={"test_generation"},
         skills_config=skills_config,
         notify_cfg=notify_cfg,
         agent_resolver=agent_resolver,
         status_callback=status_callback,
+        output_data=output_data,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
     )
 
     manager = UnitTestWorkflow()
@@ -602,137 +782,11 @@ def _notification_color(notif_data: dict) -> str:
     return "green"
 
 
-def _notification_event_attributes(notif_data: dict) -> dict:
-    """Derive policy-matching attributes from a normalized notification event."""
-    event_type = notif_data.get("type", "generic")
-    data = notif_data.get("data", {}) or {}
-    status = str(data.get("status") or "")
-    severity = "low"
-    blocked = bool(data.get("blocked", False))
-
-    if event_type == "code_review_result":
-        severity_rank = _code_review_severity(data)
-        severity = {0: "low", 1: "low", 2: "medium", 3: "high", 4: "critical"}.get(
-            severity_rank, "low"
-        )
-        status = "blocked" if blocked else (status or "success")
-    elif event_type == "test_generation_result":
-        worktree_status = (data.get("worktree_run") or {}).get("status")
-        if worktree_status:
-            status = "success" if worktree_status == "passed" else str(worktree_status)
-    elif event_type == "quality_score_result":
-        quality = notif_data.get("quality_score") or data.get("quality_score") or {}
-        risk_level = str(quality.get("risk_level") or "").lower()
-        if risk_level in {"low", "medium", "high", "critical"}:
-            severity = risk_level
-        total_score = quality.get("total_score")
-        if not status:
-            status = "failed" if risk_level == "high" or (total_score is not None and total_score < 6) else "success"
-
-    return {
-        "event_type": event_type,
-        "status": status,
-        "severity": severity,
-        "blocked": blocked,
-    }
-
-
 async def _send_notification(notif_data: dict, notify_cfg: dict | None,
                              repo_id: int = None, branch: str = "", stage_type: str = ""):
-    """Send notification — policy-aware with repo config fallback."""
-    await _send_notifications_policy_aware(
-        notif_data, notify_cfg, repo_id=repo_id, branch=branch, stage_type=stage_type
-    )
-
-
-async def _send_notifications_policy_aware(
-    notif_data: dict,
-    notify_cfg: dict | None,
-    repo_id: int | None = None,
-    branch: str = "",
-    stage_type: str = "",
-):
-    """Send notification via policy engine first, fall back to repo config."""
-    from app.services.notify.policy_engine import resolve_policies_sync
-
-    # Try policy engine first
-    attrs = _notification_event_attributes(notif_data)
-
-    with SyncSession() as pdb:
-        policies = resolve_policies_sync(
-            pdb,
-            repo_id=repo_id,
-            branch=branch,
-            event_type=attrs["event_type"],
-            stage_type=stage_type,
-            status=attrs["status"],
-            severity=attrs["severity"],
-            blocked=attrs["blocked"],
-        )
-
-    sent_via_policy = False
-    if policies:
-        for policy in policies:
-            if policy.notify_config_id:
-                # Build a notify_cfg from the policy's channel
-                with SyncSession() as pdb:
-                    from app.models import NotifyConfig
-                    nc = pdb.execute(
-                        select(NotifyConfig).where(NotifyConfig.id == policy.notify_config_id)
-                    ).scalar_one_or_none()
-                if nc and nc.enabled:
-                    sent_via_policy = True
-                    targets = policy.targets or []
-                    if not targets:
-                        targets = [{"type": "notify_config", "id": nc.id, "name": nc.name}]
-                    for target_info in targets:
-                        policy_notify_cfg = _policy_notify_cfg(
-                            nc,
-                            policy,
-                            target_info,
-                            notify_cfg.get("task_id") if notify_cfg else None,
-                            repo_id,
-                        )
-                        await _send_one(notif_data, policy_notify_cfg)
-        if sent_via_policy:
-            return
-
-    # Fall back to old repo-level config
+    """Send notification via repo-level config."""
     if notify_cfg:
         await _send_one(notif_data, notify_cfg)
-
-
-def _policy_notify_cfg(notify_config, policy, target_info: dict, task_id: str | None, repo_id: int | None) -> dict:
-    """Build a notify config for one policy target.
-
-    For webhook-style targets, a policy may override the channel webhook_url via:
-    {"type": "webhook", "name": "QA group", "webhook_url": "...", "sign_key": "..."}
-    If no override is provided, the selected notify_config is used as-is.
-    """
-    cfg = dict(notify_config.config or {})
-    target_type = str(target_info.get("type") or "notify_config")
-    target_name = target_info.get("name") or target_info.get("id") or notify_config.name
-
-    webhook_url = target_info.get("webhook_url")
-    if webhook_url:
-        cfg["webhook_url"] = webhook_url
-    if target_info.get("sign_key"):
-        cfg["sign_key"] = target_info.get("sign_key")
-
-    return {
-        "id": notify_config.id,
-        "name": notify_config.name,
-        "provider": notify_config.provider,
-        "config": cfg,
-        "settings": {
-            "enabled_events": None,  # policy already filters
-            "min_severity": "all",
-            "blocked_only": False,
-        },
-        "task_id": task_id,
-        "repo_id": repo_id,
-        "target_label": f"{policy.name}:{target_type}:{target_name}",
-    }
 
 
 async def _send_one(notif_data: dict, notify_cfg: dict):

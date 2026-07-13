@@ -262,7 +262,7 @@ class TestPipelineContextIntegration:
         ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        assert manager._engine_for(ctx, "code_review") is engine_analysis
+        assert resolver.get_engine("code_review") is engine_analysis
         assert manager._engine_for(ctx, "generator") is engine_gen
         assert manager._engine_for(ctx, "validate_repair") is fallback
         assert manager._engine_for(ctx, "quality_scorer") is fallback
@@ -276,7 +276,8 @@ class TestPipelineContextIntegration:
         ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        for stage in ["code_review", "generator", "validate_repair", "quality_scorer"]:
+        assert resolver.get_engine("code_review") is fallback
+        for stage in ["generator", "validate_repair", "quality_scorer"]:
             assert manager._engine_for(ctx, stage) is fallback
 
     def test_engine_for_full_resolver(self):
@@ -316,7 +317,7 @@ class TestPipelineContextIntegration:
         ctx = PipelineContext(engine=fallback, agent_resolver=resolver)
         manager = TestManagerAgent()
 
-        assert manager._engine_for(ctx, "code_review") is e1
+        assert resolver.get_engine("code_review") is e1
         assert manager._engine_for(ctx, "generator") is e2
         assert manager._engine_for(ctx, "validate_repair") is e3
         assert manager._engine_for(ctx, "quality_scorer") is e4

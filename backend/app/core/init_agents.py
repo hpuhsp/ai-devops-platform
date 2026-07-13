@@ -64,9 +64,6 @@ async def init_default_agents(db: AsyncSession):
             skill_type="builtin",
             skill_name=spec["skill_name"],
             model_id=None,
-            skill_config={},
-            model_config={},
-            policy_config={},
             enabled=True,
             is_system=True,
         )
