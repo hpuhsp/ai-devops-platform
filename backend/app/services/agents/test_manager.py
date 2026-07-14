@@ -100,6 +100,8 @@ class PipelineContext:
     generated_files: list = field(default_factory=list)
     test_framework: str = ""
     worktree_result: dict = field(default_factory=dict)
+    validation_result: Any = None
+    test_review_result: dict = field(default_factory=dict)
     repair_history: list = field(default_factory=list)
     quality_score: dict | None = None
 
@@ -116,6 +118,8 @@ class UnitTestWorkflow:
     _STAGE_TO_TYPE = {
         "change_intelligence": "change_intelligence",
         "generator": "generator",
+        "test_runner": "validate_repair",
+        "test_repair": "validate_repair",
         "validate_repair": "validate_repair",
         "quality_scorer": "quality_scorer",
     }
@@ -124,6 +128,9 @@ class UnitTestWorkflow:
         "change_intelligence": "change_intelligence",
         "context": "context",
         "generator": "test_generation",
+        "test_review": "test_review",
+        "test_runner": "test_generation",
+        "test_repair": "test_generation",
         "validate_repair": "test_generation",
         "quality_scorer": "quality_score",
         "mr_feedback": "auto_merge",
@@ -132,12 +139,42 @@ class UnitTestWorkflow:
     _TERMINAL_FAILURES = {"failed", "blocked"}
 
     _ACTION_TO_STAGE = {
+        "run_change_understanding_agent": "change_intelligence",
+        "run_test_planning_agent": "context",
+        "run_test_generation_agent": "generator",
+        "run_test_review_agent": "test_review",
+        "run_test_runner_agent": "test_runner",
+        "run_test_repair_agent": "test_repair",
+        "run_quality_judge_agent": "quality_scorer",
+        "run_feedback_agent": "mr_feedback",
         "analyze_change": "change_intelligence",
         "build_context": "context",
         "generate_tests": "generator",
-        "validate_tests": "validate_repair",
+        "validate_tests": "test_runner",
         "score_quality": "quality_scorer",
         "publish_feedback": "mr_feedback",
+    }
+
+    _STAGE_TO_SUBAGENT = {
+        "change_intelligence": "change-understanding-agent",
+        "context": "test-planning-agent",
+        "generator": "test-generation-agent",
+        "test_review": "test-review-agent",
+        "test_runner": "test-runner-agent",
+        "test_repair": "test-repair-agent",
+        "quality_scorer": "quality-judge-agent",
+        "mr_feedback": "feedback-agent",
+    }
+
+    _SUBAGENT_TOOL_REQUESTS = {
+        "change_intelligence": {"Read", "Grep", "Glob"},
+        "context": {"Read", "Grep", "Glob"},
+        "generator": {"Read", "Write", "Grep", "Glob"},
+        "test_review": {"Read", "Grep", "Glob"},
+        "test_runner": {"Bash", "Read", "Grep", "Glob"},
+        "test_repair": {"Read", "Write", "Edit", "Grep", "Glob"},
+        "quality_scorer": {"Read", "Grep", "Glob"},
+        "mr_feedback": {"Read", "Grep", "Glob"},
     }
 
     def __init__(self):
@@ -145,6 +182,9 @@ class UnitTestWorkflow:
             ("change_intelligence", self._stage_change_intelligence),
             ("context", self._stage_context),
             ("generator", self._stage_generator),
+            ("test_review", self._stage_test_review),
+            ("test_runner", self._stage_run_tests),
+            ("test_repair", self._stage_repair_tests),
             ("validate_repair", self._stage_validate_repair),
             ("quality_scorer", self._stage_quality_scorer),
             ("mr_feedback", self._stage_mr_feedback),
@@ -203,6 +243,11 @@ class UnitTestWorkflow:
                                    duration_ms=result.duration_ms,
                                    round_number=round_number)
                 executed_actions.add(decision.action)
+                if decision.action == "run_test_runner_agent" and result.status == "needs_repair":
+                    executed_actions.discard("run_test_repair_agent")
+                if decision.action == "run_test_repair_agent" and result.status == "success":
+                    executed_actions.discard("run_test_runner_agent")
+                    executed_actions.discard("validate_tests")
                 logger.info("pipeline.action_done", action=decision.action,
                             stage=stage_name, status=result.status)
 
@@ -283,16 +328,47 @@ class UnitTestWorkflow:
         })
         await self._persist(ctx, "events", ctx.output_data["events"])
 
+    async def _enter_subagent(self, ctx: PipelineContext, stage_name: str) -> dict:
+        """Validate and record the subagent contract used by a stage."""
+        agent_name = self._STAGE_TO_SUBAGENT.get(stage_name)
+        if not agent_name:
+            return {}
+        from app.services.unit_test_engine.subagent_runtime import subagent_runtime
+
+        requested_tools = self._SUBAGENT_TOOL_REQUESTS.get(stage_name, set())
+        subagent_runtime.validate_tool_request(agent_name, requested_tools)
+        definition = subagent_runtime.load(agent_name)
+        trace = {
+            "stage": stage_name,
+            "agent": definition.name,
+            "definition_path": str(definition.path),
+            "requested_tools": sorted(requested_tools),
+            "allowed_tools": sorted(definition.allowed_tools),
+            "allowed_skills": definition.allowed_skills,
+        }
+        ctx.output_data.setdefault("subagent_trace", [])
+        ctx.output_data["subagent_trace"].append(trace)
+        await self._persist(ctx, "subagent_trace", ctx.output_data["subagent_trace"])
+        return trace
+
     async def _execute_manager_action(
         self,
         ctx: PipelineContext,
         decision: ManagerDecision,
     ) -> StageResult:
         actions = {
+            "run_change_understanding_agent": self._stage_change_intelligence,
+            "run_test_planning_agent": self._stage_context,
+            "run_test_generation_agent": self._stage_generator,
+            "run_test_review_agent": self._stage_test_review,
+            "run_test_runner_agent": self._stage_run_tests,
+            "run_test_repair_agent": self._stage_repair_tests,
+            "run_quality_judge_agent": self._stage_quality_scorer,
+            "run_feedback_agent": self._stage_mr_feedback,
             "analyze_change": self._stage_change_intelligence,
             "build_context": self._stage_context,
             "generate_tests": self._stage_generator,
-            "validate_tests": self._stage_validate_repair,
+            "validate_tests": self._stage_run_tests,
             "score_quality": self._stage_quality_scorer,
             "publish_feedback": self._stage_mr_feedback,
         }
@@ -451,6 +527,7 @@ class UnitTestWorkflow:
     # ── Stage Implementations ────────────────────────────────────────────────
 
     async def _stage_change_intelligence(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "change_intelligence")
         if "test_generation" not in ctx.enabled_stages:
             await self._persist(ctx, "test_generation", {"status": "skipped"})
             return StageResult(status="gated")
@@ -510,6 +587,7 @@ class UnitTestWorkflow:
                            completion_tokens=ci_result.completion_tokens, duration_ms=ms)
 
     async def _stage_context(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "context")
         test_cfg = ctx.skills_config.get("test_generation", {})
         codegraph_db = test_cfg.get("codegraph_db_path", "codegraph.db")
         context_output = {}
@@ -548,6 +626,7 @@ class UnitTestWorkflow:
         return StageResult(status="success", output=context_output, duration_ms=ms)
 
     async def _stage_generator(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "generator")
         from app.services.skills.runtime import skill_runtime
         test_cfg = ctx.skills_config.get("test_generation", {})
         engine = self._engine_for(ctx, "generator")
@@ -587,6 +666,200 @@ class UnitTestWorkflow:
         return StageResult(status=status, output=output,
                            prompt_tokens=tg.prompt_tokens,
                            completion_tokens=tg.completion_tokens, duration_ms=ms)
+
+    async def _stage_test_review(self, ctx: PipelineContext) -> StageResult:
+        """Review generated test artifacts before they are executed."""
+        await self._enter_subagent(ctx, "test_review")
+        start = time.time()
+        violations = []
+        reviewed_files = []
+        for item in ctx.generated_files or []:
+            path = (item.get("path") or item.get("file_path") or "").replace("\\", "/")
+            content = item.get("content", "")
+            reviewed_files.append(path)
+            if not self._is_test_file_path(path):
+                violations.append({
+                    "path": path,
+                    "reason": "generated file is outside the allowed test-file scope",
+                })
+            if any(marker in content for marker in ("os.environ[", "requests.", "httpx.")):
+                violations.append({
+                    "path": path,
+                    "reason": "generated test may touch environment or network directly",
+                })
+
+        status = "success" if not violations else "failed"
+        result = {
+            "status": status,
+            "reviewed_files": reviewed_files,
+            "violations": violations,
+        }
+        ctx.test_review_result = result
+        await self._persist(ctx, "test_review", result)
+        await self._record(
+            ctx,
+            "test_review",
+            status,
+            {"files": reviewed_files},
+            result,
+            0,
+            0,
+            int((time.time() - start) * 1000),
+        )
+        return StageResult(status=status, output=result, duration_ms=int((time.time() - start) * 1000))
+
+    @staticmethod
+    def _is_test_file_path(path: str) -> bool:
+        normalized = path.strip().replace("\\", "/")
+        name = normalized.rsplit("/", 1)[-1]
+        return (
+            normalized.startswith(("tests/", "test/", "__tests__/"))
+            or name.startswith("test_")
+            or name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", ".test.js", ".spec.js"))
+        )
+
+    async def _stage_run_tests(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "test_runner")
+        from app.tasks.ai_tasks import _run_worktree_tests, _safe_test_command
+        from app.services.agents.validator_agent import ValidatorAgent
+
+        files = ctx.generated_files
+        cmd = _safe_test_command(ctx.test_framework)
+        if not files:
+            return StageResult(status="skipped", reason="no files generated",
+                               output={"status": "skipped", "reason": "no files generated"})
+        if not cmd:
+            reason = f"framework '{ctx.test_framework}' not runnable in sandbox"
+            wr = {"status": "blocked", "reason": reason}
+            ctx.worktree_result = wr
+            await self._persist(ctx, "test_runner", wr)
+            return StageResult(status="blocked", reason=reason, output=wr)
+
+        start = time.time()
+        branch_or_sha = ctx.skill_context.branch or ctx.skill_context.commit_sha
+        wr = await _run_worktree_tests(ctx.git_agent, branch_or_sha, files, cmd)
+        run_ms = int((time.time() - start) * 1000)
+
+        validator = ValidatorAgent()
+        validation = validator.parse_worktree_result(wr, duration_ms=run_ms)
+        ctx.validation_result = validation
+        wr["final_validation"] = validation.to_dict()
+        ctx.worktree_result = wr
+
+        output_status = "success" if wr.get("status") == "passed" else "needs_repair"
+        generator_output = {
+            "status": output_status,
+            "reason": wr.get("reason") or wr.get("error"),
+            "framework": ctx.test_framework,
+            "generated_files": ctx.generated_files,
+            "worktree_run": wr,
+            "repair_history": ctx.repair_history,
+        }
+        await self._persist(ctx, "test_generation", generator_output)
+        await self._persist(ctx, "test_runner", wr)
+        await self._record(
+            ctx,
+            "test_runner",
+            output_status,
+            {"files_count": len(files), "command": cmd},
+            wr,
+            0,
+            0,
+            run_ms,
+        )
+        return StageResult(status=output_status, output=wr, duration_ms=run_ms)
+
+    async def _stage_repair_tests(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "test_repair")
+        from app.services.agents.repair_agent import RepairAgent
+
+        validation = ctx.validation_result
+        if validation is None:
+            return StageResult(
+                status="failed",
+                reason="validation result is not available",
+                output={"status": "failed", "reason": "validation result is not available"},
+            )
+        if not validation.can_repair:
+            return StageResult(
+                status="blocked",
+                reason="validation result is not repairable",
+                output={"status": "blocked", "reason": "validation result is not repairable"},
+            )
+
+        agents_cfg = ctx.skills_config.get("agents", {})
+        if not agents_cfg.get("repair_enabled", True):
+            return StageResult(
+                status="blocked",
+                reason="repair is disabled by configuration",
+                output={"status": "blocked", "reason": "repair is disabled by configuration"},
+            )
+
+        max_rounds = agents_cfg.get("max_repair_rounds") or _setting("MAX_REPAIR_ROUNDS", 2)
+        if len(ctx.repair_history) >= int(max_rounds):
+            return StageResult(
+                status="blocked",
+                reason=f"repair max rounds exhausted: {max_rounds}",
+                output={"status": "blocked", "reason": f"repair max rounds exhausted: {max_rounds}"},
+            )
+
+        start = time.time()
+        repair_agent = RepairAgent()
+        repair_engine = self._engine_for(ctx, "validate_repair")
+        round_number = len(ctx.repair_history) + 1
+        rr = await repair_agent.repair(
+            repair_engine,
+            validation,
+            ctx.generated_files,
+            round_number=round_number,
+            context_hint=ctx.context_agent_output.get("test_style_example", ""),
+        )
+        ms = int((time.time() - start) * 1000)
+        if not rr.success or not rr.repaired_files:
+            output = rr.to_dict()
+            output["status"] = "failed"
+            await self._persist(ctx, "test_repair", output)
+            return StageResult(
+                status="failed",
+                reason=rr.summary,
+                output=output,
+                prompt_tokens=rr.prompt_tokens,
+                completion_tokens=rr.completion_tokens,
+                duration_ms=ms,
+            )
+
+        repair_map = {rf["path"]: rf["content"] for rf in rr.repaired_files}
+        ctx.generated_files = [
+            {"path": f["path"], "content": repair_map.get(f["path"], f.get("content", ""))}
+            for f in ctx.generated_files
+        ]
+        ctx.repair_history.append({
+            "round": round_number,
+            "fixes": [action.fix_description for action in rr.actions],
+            "summary": rr.summary,
+        })
+        output = rr.to_dict()
+        output["status"] = "success"
+        output["repair_history"] = ctx.repair_history
+        await self._persist(ctx, "test_repair", output)
+        await self._record(
+            ctx,
+            "test_repair",
+            "success",
+            {"round": round_number, "failures_count": len(validation.failures)},
+            output,
+            rr.prompt_tokens,
+            rr.completion_tokens,
+            ms,
+            round_number,
+        )
+        return StageResult(
+            status="success",
+            output=output,
+            prompt_tokens=rr.prompt_tokens,
+            completion_tokens=rr.completion_tokens,
+            duration_ms=ms,
+        )
 
     async def _stage_validate_repair(self, ctx: PipelineContext) -> StageResult:
         from app.tasks.ai_tasks import _safe_test_command, _validate_repair_loop
@@ -653,6 +926,7 @@ class UnitTestWorkflow:
         return StageResult(status=stage_status, output=wr)
 
     async def _stage_quality_scorer(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "quality_scorer")
         if not ctx.generated_files or not _setting("TEST_QUALITY_SCORING_ENABLED", True):
             return StageResult(status="skipped")
 
@@ -695,6 +969,7 @@ class UnitTestWorkflow:
                            prompt_tokens=pt, completion_tokens=ct, duration_ms=ms)
 
     async def _stage_mr_feedback(self, ctx: PipelineContext) -> StageResult:
+        await self._enter_subagent(ctx, "mr_feedback")
         if not _setting("MR_COMMENT_ENABLED", False):
             return StageResult(status="skipped")
         return StageResult(status="success", output=await ctx.ports.publish_mr_feedback(ctx))

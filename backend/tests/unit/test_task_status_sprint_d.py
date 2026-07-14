@@ -125,7 +125,8 @@ class TestStageStatusMap:
     def test_all_stages_covered(self):
         expected_stages = {
             "code_review", "change_intelligence", "context",
-            "generator", "validate_repair", "quality_scorer", "mr_feedback",
+            "generator", "test_review", "test_runner", "test_repair",
+            "validate_repair", "quality_scorer", "mr_feedback",
         }
         assert set(STAGE_STATUS_MAP.keys()) == expected_stages
 

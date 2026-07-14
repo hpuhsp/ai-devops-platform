@@ -574,7 +574,14 @@ class TestPipelineAgentIntegration:
         await manager._block_remaining(ctx, "generator", "failed", "no files generated")
 
         stages = [item["stage"] for item in ctx.output_data["stage_results"]]
-        assert stages == ["validate_repair", "quality_scorer", "mr_feedback"]
+        assert stages == [
+            "test_review",
+            "test_runner",
+            "test_repair",
+            "validate_repair",
+            "quality_scorer",
+            "mr_feedback",
+        ]
         assert all(item["status"] == "blocked" for item in ctx.output_data["stage_results"])
 
     def test_pipeline_context_can_set_agent_resolver(self):
@@ -647,6 +654,8 @@ class TestPipelineAgentIntegration:
         expected = {
             "change_intelligence": "change_intelligence",
             "generator": "generator",
+            "test_runner": "validate_repair",
+            "test_repair": "validate_repair",
             "validate_repair": "validate_repair",
             "quality_scorer": "quality_scorer",
         }

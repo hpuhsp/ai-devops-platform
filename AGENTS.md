@@ -11,3 +11,7 @@ Before starting/restarting any service:
 4. Starting local services on different ports creates conflicts and wastes time
 
 This project runs via Docker Compose: api (8090), frontend (3010), flower (5555), postgres (5432), redis (6379), worker.
+
+## Skill Usage Preferences
+
+Do not use `superpowers` or `dev-pipeline` unless the user explicitly asks for either skill by name or explicitly requests that workflow.

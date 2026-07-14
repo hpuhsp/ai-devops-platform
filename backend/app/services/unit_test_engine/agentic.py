@@ -10,6 +10,14 @@ from app.services.skills.open_registry import open_skill_registry
 
 
 ALLOWED_MANAGER_ACTIONS = {
+    "run_change_understanding_agent",
+    "run_test_planning_agent",
+    "run_test_generation_agent",
+    "run_test_review_agent",
+    "run_test_runner_agent",
+    "run_test_repair_agent",
+    "run_quality_judge_agent",
+    "run_feedback_agent",
     "analyze_change",
     "build_context",
     "generate_tests",
@@ -18,6 +26,26 @@ ALLOWED_MANAGER_ACTIONS = {
     "publish_feedback",
     "finish",
     "fail",
+}
+
+SUBAGENT_ACTIONS = {
+    "run_change_understanding_agent",
+    "run_test_planning_agent",
+    "run_test_generation_agent",
+    "run_test_review_agent",
+    "run_test_runner_agent",
+    "run_test_repair_agent",
+    "run_quality_judge_agent",
+    "run_feedback_agent",
+}
+
+LEGACY_ACTION_ALIASES = {
+    "analyze_change": "run_change_understanding_agent",
+    "build_context": "run_test_planning_agent",
+    "generate_tests": "run_test_generation_agent",
+    "validate_tests": "run_test_runner_agent",
+    "score_quality": "run_quality_judge_agent",
+    "publish_feedback": "run_feedback_agent",
 }
 
 
@@ -95,25 +123,40 @@ class ManagerFallbackPolicy:
             )
 
         ordered = [
-            ("analyze_change", "fallback: inspect whether changed code needs tests"),
-            ("build_context", "fallback: build minimal context before generation"),
-            ("generate_tests", "fallback: generate candidate unit tests"),
-            ("validate_tests", "fallback: validate generated tests and repair if needed"),
-            ("score_quality", "fallback: score generated tests after validation"),
-            ("publish_feedback", "fallback: publish feedback if configured"),
+            ("run_change_understanding_agent", "fallback: inspect whether changed code needs tests"),
+            ("run_test_planning_agent", "fallback: build minimal test plan and context"),
+            ("run_test_generation_agent", "fallback: generate candidate unit tests"),
+            ("run_test_review_agent", "fallback: review generated tests before execution"),
+            ("run_test_runner_agent", "fallback: run generated tests with an allowlisted command"),
+            ("run_test_repair_agent", "fallback: repair failed generated tests"),
+            ("run_quality_judge_agent", "fallback: score generated tests after validation"),
+            ("run_feedback_agent", "fallback: publish feedback if configured"),
             ("finish", "fallback: default workflow completed"),
         ]
         for action, reason in ordered:
             if action not in executed_actions:
-                if action == "build_context" and not ctx.change_intel_data:
+                if action == "run_test_planning_agent" and not ctx.change_intel_data:
                     continue
-                if action == "generate_tests" and ctx.change_intel_data.get("need_test") is False:
+                if action == "run_test_generation_agent" and ctx.change_intel_data.get("need_test") is False:
                     return ManagerDecision(
                         action="finish",
                         reason="fallback: change analysis decided tests are not needed",
                         source="fallback",
                     )
-                if action in {"validate_tests", "score_quality"} and not ctx.generated_files:
+                if action in {
+                    "run_test_review_agent",
+                    "run_test_runner_agent",
+                    "run_test_repair_agent",
+                    "run_quality_judge_agent",
+                } and not ctx.generated_files:
+                    continue
+                if action == "run_test_repair_agent":
+                    validation = ctx.worktree_result.get("final_validation") if isinstance(ctx.worktree_result, dict) else {}
+                    if ctx.worktree_result.get("status") == "passed":
+                        continue
+                    if not validation or not validation.get("can_repair"):
+                        continue
+                if action == "run_quality_judge_agent" and ctx.worktree_result.get("status") != "passed":
                     continue
                 return ManagerDecision(action=action, reason=reason, source="fallback")
         return ManagerDecision(action="finish", reason="fallback: no remaining action", source="fallback")
@@ -171,7 +214,8 @@ class ManagerDecisionEngine:
             "Your scope is unit-test work only: change analysis, context selection, test generation, "
             "test validation/repair, quality scoring, and feedback. Code review is an outer pipeline "
             "stage. You may read code_review_result as context, but you must never request or simulate "
-            "code review. Choose exactly one next action from the allowlist. Return only valid JSON, "
+            "code review. Choose exactly one next subagent action from the allowlist. Legacy action "
+            "names are accepted only for backward compatibility; prefer run_*_agent actions. Return only valid JSON, "
             "with no markdown and no prose outside the JSON object. Do not request arbitrary shell "
             "execution, secret access, repository mutation outside generated tests, or unlisted tools. "
             "Prefer minimal context and token-efficient skills. "
@@ -180,14 +224,16 @@ class ManagerDecisionEngine:
             "\"expected_outcome\": string}. "
             "Decision rules: "
             "1) If test_generation is not enabled, choose finish. "
-            "2) If change analysis is missing, choose analyze_change. "
+            "2) If change analysis is missing, choose run_change_understanding_agent. "
             "3) If change analysis says tests are not needed, choose finish. "
-            "4) If context is missing after change analysis, choose build_context. "
-            "5) If no tests exist and tests are needed, choose generate_tests. "
-            "6) If tests exist but validation has not run or failed in a repairable way, choose validate_tests. "
-            "7) If validation passed and quality is missing, choose score_quality. "
-            "8) Choose publish_feedback only after quality scoring or a terminal skip/failure needs reporting. "
-            "9) Choose fail only when no allowed action can make progress."
+            "4) If context/test plan is missing after change analysis, choose run_test_planning_agent. "
+            "5) If no tests exist and tests are needed, choose run_test_generation_agent. "
+            "6) If generated tests have not been reviewed, choose run_test_review_agent. "
+            "7) If reviewed tests have not run, choose run_test_runner_agent. "
+            "8) If test run failed and is repairable, choose run_test_repair_agent, then run_test_runner_agent again. "
+            "9) If validation passed and quality is missing, choose run_quality_judge_agent. "
+            "10) Choose run_feedback_agent only after quality scoring or a terminal skip/failure needs reporting. "
+            "11) Choose fail only when no allowed action can make progress."
         )
 
     def _user_prompt(self, ctx: Any, round_number: int, executed_actions: set[str]) -> str:
@@ -227,6 +273,16 @@ class ManagerDecisionEngine:
                 "allowed_write_scope": "generated test files only",
             },
             "available_skill_cards": cards,
+            "available_subagents": [
+                "change-understanding-agent",
+                "test-planning-agent",
+                "test-generation-agent",
+                "test-review-agent",
+                "test-runner-agent",
+                "test-repair-agent",
+                "quality-judge-agent",
+                "feedback-agent",
+            ],
         }
         return json.dumps(state, ensure_ascii=False)
 
@@ -239,16 +295,38 @@ class ManagerDecisionEngine:
             "generate_tests",
             "validate_tests",
             "score_quality",
+            "run_change_understanding_agent",
+            "run_test_planning_agent",
+            "run_test_generation_agent",
+            "run_test_review_agent",
+            "run_test_runner_agent",
+            "run_test_repair_agent",
+            "run_quality_judge_agent",
         } and "test_generation" not in ctx.enabled_stages:
             return "test_generation stage is not enabled"
-        if action == "build_context" and not ctx.change_intel_data:
+        if action in {"build_context", "run_test_planning_agent"} and not ctx.change_intel_data:
             return "change analysis has not completed"
-        if action == "generate_tests" and ctx.change_intel_data.get("need_test") is False:
+        if action in {"generate_tests", "run_test_generation_agent"} and ctx.change_intel_data.get("need_test") is False:
             return "change analysis decided tests are not needed"
-        if action in {"validate_tests", "score_quality"} and not ctx.generated_files:
+        if action in {
+            "validate_tests",
+            "score_quality",
+            "run_test_review_agent",
+            "run_test_runner_agent",
+            "run_test_repair_agent",
+            "run_quality_judge_agent",
+        } and not ctx.generated_files:
             return "no generated tests are available"
-        if action == "score_quality" and not ctx.worktree_result:
+        if action == "run_test_repair_agent":
+            validation = ctx.worktree_result.get("final_validation") if isinstance(ctx.worktree_result, dict) else None
+            if not validation:
+                return "validation result is not available"
+            if not validation.get("can_repair"):
+                return "validation result is not repairable"
+        if action in {"score_quality", "run_quality_judge_agent"} and not ctx.worktree_result:
             return "validation result is not available"
+        if action == "run_quality_judge_agent" and ctx.worktree_result.get("status") != "passed":
+            return "tests have not passed"
         return None
 
     @staticmethod
